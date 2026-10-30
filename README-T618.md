@@ -61,26 +61,35 @@ no-descriptor-indexing path binding state per draw: ~80–120 ms/frame.
 
 ## Roadmap
 
-### Strip batching without ExtendedDynamicState2 — the big one
+### Strip batching without ExtendedDynamicState2 — DONE, and extended
 
-The back end already joins short same-state strips into one indexed draw with
-primitive restart (`hw/xbox/hle/vk/batch.c`; Blinx: ~500k strip draws/s
-joined). On this GPU it never runs:
+The back end joins short same-state strips into one indexed draw with
+primitive restart (`hw/xbox/hle/vk/batch.c`), but on this GPU it never ran
+(`strip batching off: no dynamic primitive restart`). Two changes landed:
 
-```
-strip batching off: no dynamic primitive restart
-```
+1. The restart comes from the **pipelines** (`primitiveRestartEnable`, core
+   Vulkan 1.0 for strips) when `VK_EXT_extended_dynamic_state_2` is absent.
+2. **Indexed strip runs** (`hle_batch_draw_idx`): titles that draw strips
+   indexed (Sega GT 2002 races: ~23k indexed strips/s) never reached the
+   batch before — only unindexed strips (Blinx's shape) did. Their 16-bit
+   arena indices are copied into the run rebased to its vertexOffset.
 
-`hle_batch_init` gates it on `caps.eds2` (`VK_EXT_extended_dynamic_state2`,
-absent on Mali r34) because the joined draw enables restart dynamically.
-**Primitive restart for strips is core Vulkan 1.0 via the pipeline's
-`primitiveRestartEnable`** — no dynamic state needed. Plan: build strip
-pipelines with restart on (a restart index that never appears is harmless to
-unjoined strips), relax the gate, measure Sega GT races.
+Measured: BGE's heavy scenes join 430 batches/s of 865 draws, rendering
+identically. Runs whose draws carry a vertex binding between them stay one
+draw — a join across different vertex buffer offsets needs the offset delta
+folded into the indices and the bind recording suppressed (next step).
+
+### The next bottleneck, now measured
+
+The same scenes run ~27k draws/s with **~12k pipeline and ~11.6k descriptor
+binds a second** — per-draw state churn, the Bifrost no-descriptor-indexing
+tax. Strip joining shaves the draws; the state binds are the bigger cost and
+the real remaining ceiling for this GPU.
 
 ### Then
 
-- Per-draw descriptor work on the no-indexing path (`vk/draw.c` set1/pc
-  counts in the emit stats) — the next slice of per-draw overhead.
+- Join across differing vertex buffer offsets (offset delta folded into the
+  rebase, bind recording suppressed for held draws).
 - Deus Ex is CPU-bound in the guest; nothing GPU-side helps it.
-- Upstream: the two quirks above are PR-ready with their measurements.
+- Upstream: the two driver quirks are PR-ready with their measurements; the
+  eds2-free batching is a candidate once it has more device mileage.
