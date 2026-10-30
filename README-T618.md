@@ -74,7 +74,8 @@ primitive restart (`hw/xbox/hle/vk/batch.c`), but on this GPU it never ran
    batch before — only unindexed strips (Blinx's shape) did. Their 16-bit
    arena indices are copied into the run rebased to its vertexOffset.
 
-Measured: BGE's heavy scenes join 430 batches/s of 865 draws, rendering
+Measured: Sega GT 2002's heavy scenes (the game that drew ~23k indexed
+strips a second in races) join 430 batches/s of 865 draws, rendering
 identically. Runs whose draws carry a vertex binding between them stay one
 draw — a join across different vertex buffer offsets needs the offset delta
 folded into the indices and the bind recording suppressed (next step).
