@@ -2408,11 +2408,13 @@ static unsigned g_rt_told;
  * a swizzled 256 x 256 target through its linear view and blurs it from
  * there with a linear texture, by texel; addressed normalized, as the
  * swizzled object, every tap clamped to the corner and the halo was gone. */
-/* A surface's scale as the 2 bits the shaders read (ff.h HLE_SSCL_GLSL):
+/* A surface's scale as the 2 bits the shaders read (ff.h HLE_SSCL_GLSL),
+ * at its stage's slot in flags' top byte (24 + 2 * stage):
  * 0: 1x (guest-resolution surfaces), 1: 0.5x, 2: 2x, 3: 4x */
-static uint32_t sscl_code(uint32_t e8)
+static uint32_t sscl_code(uint32_t e8, unsigned st)
 {
-    return e8 == 4 ? 1 : e8 == 16 ? 2 : e8 == 32 ? 3 : 0;
+    uint32_t code = e8 == 4 ? 1 : e8 == 16 ? 2 : e8 == 32 ? 3 : 0;
+    return code << (24u + 2u * st);
 }
 
 static uint32_t stage_slot(const HleCmdDraw *c, unsigned st, uint32_t rt_id, uint32_t *flags,
@@ -2429,13 +2431,13 @@ static uint32_t stage_slot(const HleCmdDraw *c, unsigned st, uint32_t rt_id, uin
                (rt = hle_surf_get(rt_id)) != NULL) {
         slot = g_snap[g_snap_cur].slot;  /* the target, copied before the draw */
         *flags |= (c->tex_lin >> st & 1) ? (1u << st) | (256u << st) : 0;
-        *scl |= sscl_code(rt->scale) << (2 * st);
+        *scl |= sscl_code(rt->scale, st);
         return slot;
     } else if (ts && (ts->general || ts->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)) {
         slot = surf_slot(ts, c->tex_ord >> 2 * st & 3);  /* RT as texture (identity) */
         /* linear format: texel coords, of the surface's own scale */
         *flags |= (c->tex_lin >> st & 1) ? (1u << st) | (256u << st) : 0;
-        *scl |= sscl_code(ts->scale) << (2 * st);
+        *scl |= sscl_code(ts->scale, st);
     }
     uint32_t id = c->tex[st];
     if (id && !tx && id < 8192 && g_rt_told < 64 && !(g_rt_seen[id >> 3] >> (id & 7) & 1)) {
@@ -3440,7 +3442,7 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
         /* fixed-function shadow buffers: not yet (white, as before) */
         uint32_t slot = shadow_fmt(c->tex[st]) ? 0 : stage_slot(c, st, rt_id, &lin, &scl);
         pc.flags |= (lin >> st & 1) << ki | (lin >> (st + 8) & 1) << (ki + 8) |
-                    (scl >> (2 * st) & 3u) << (2 * ki);
+                    (scl >> (24u + 2u * st) & 3u) << (24u + 2u * ki);
         fs->texture = c->tex[st] != 0;
         fs->unset = c->tex_unset >> st & 1;
         fs->alpha_kill = fs->texture && t[TSS_ALPHAKILL] != 0;
