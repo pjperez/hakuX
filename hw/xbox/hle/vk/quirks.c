@@ -55,6 +55,16 @@ static bool not_adreno(const HleDriver *d)
     return !qualcomm_proprietary(d) && !mesa_turnip(d);
 }
 
+/* The present CPU wait is for Qualcomm's driver, which parks the queue's
+ * lock for 3-6 ms a present; Arm's driver returns without it. Measured on
+ * a Mali-G52 (RG Vita, r34p0, Vulkan 1.1): with the wait the presenter
+ * burned 620-730 ms/s of CPU waiting for its passes, without it 0.3 ms/s
+ * and no rendering difference (Sega GT 2002, Beyond Good & Evil). */
+static bool not_turnip_not_arm(const HleDriver *d)
+{
+    return !mesa_turnip(d) && !arm_proprietary(d);
+}
+
 /* PowerVR (vendor 0x1010) before driver 0x00582558 (ARMSX2's and PPSSPP's bound) */
 static bool powervr_old(const HleDriver *d)
 {
@@ -103,7 +113,13 @@ static const HleQuirk k_quirks[] = {
      * 3-6 ms a refresh in the driver, the queue's lock held (Halo 2).
      * Turnip's makes a sync file and returns (Mesa vk_android.c); the other
      * drivers are untested, so they keep the wait. */
-    { HLE_QUIRK_PRESENT_CPU_WAIT, "present_cpu_wait", not_turnip },
+    { HLE_QUIRK_PRESENT_CPU_WAIT, "present_cpu_wait", not_turnip_not_arm },
+    /* Arm's r34p0 Bifrost driver (Mali-G52, RG Vita): the host wait on the
+     * timeline semaphore returned VK_ERROR_DEVICE_LOST mid-game ("in
+     * vkWaitSemaphores", hle_tl_wait), across titles and at random times,
+     * while the GPU itself kept running to the moment of the call. The
+     * counter query never failed, so the waits poll it (hle_tl_sem_wait). */
+    { HLE_QUIRK_NO_SEM_WAIT, "no_sem_wait", arm_proprietary },
 };
 
 static uint32_t g_defaults;

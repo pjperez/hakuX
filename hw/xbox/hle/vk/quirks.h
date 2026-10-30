@@ -76,6 +76,13 @@ enum {
      * presents with nothing to wait for (vk/swapchain.c). On for every
      * driver but Turnip, whose present hands the compositor a fence. */
     HLE_QUIRK_PRESENT_CPU_WAIT = 1u << 11,
+    /* The host wait on a timeline semaphore (vkWaitSemaphores) returns
+     * VK_ERROR_DEVICE_LOST and takes the session down, while the counter
+     * query (vkGetSemaphoreCounterValue) keeps working. The waits poll the
+     * counter in userspace instead (hle_tl_sem_wait, vk/timeline.c). On for
+     * Arm's driver, whose r34p0 Bifrost builds (Mali-G52) lost the device
+     * this way mid-game across titles. */
+    HLE_QUIRK_NO_SEM_WAIT = 1u << 12,
 };
 
 extern uint32_t g_hle_quirks;
