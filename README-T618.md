@@ -59,11 +59,13 @@ Deliberately NOT `+dotprod`/`+rcpc`: the T618's A55 may lack them.
 Sega GT's races are the clearest case of pixel-workload bound on this GPU:
 Colin McRae pushes 2.7x the draws (59k/s) at 3.7x the framerate (48.7 vs
 13.3), so draw count is not the limit — the race's own render targets are.
-Player-measured: the **exterior race camera runs visibly faster** than the
-in-car/close views — the car's env-mapped reflective paint is the expensive
-pixel work, and it fills the screen exactly when the camera is near or in
-the car. Draw-path work cannot fix that; a per-title mod (the emulator's
-mods system) that kills or downgrades the car-paint reflection passes is
+Camera-measured (player A/B, 10s buckets): internal view 12.4 fps, external
+15.8-17.6 — and the external view submits MORE draws per second while both
+submit the same ~1000 draws / ~37k verts per FRAME. The internal view's
+extra ~17 ms/frame is per-pixel work a cockpit-only effect pays (windshield
+glass / full-screen overlay class), not geometry, not the visible car, not
+a mirror scene re-render. Draw-path work cannot fix that; a per-title mod
+(the emulator's mods system) that kills the cockpit's full-screen pass is
 the remaining lever.
 
 ## Roadmap
