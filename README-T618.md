@@ -81,6 +81,21 @@ frame-level only. The generic lever for a pixel-bound title on this GPU is
 below; a per-title mod that kills the cockpit's extra scene render remains
 the surgical fix.
 
+### Input lag: measured at ~1 second, fix proven, off pending an FEX fault
+
+The stutter monitor quantified what a race feels like: the guest's flip
+reached the display **1030-1130 ms** later (`swap -1070 write +51` lines)
+- Sega GT's push ring holds ~25 frames of commands and the game never
+polls for ring space, so it simulated at 50 Hz while the screen showed
+20 fps of frames a second old. Waiting at each flip for the previous
+flip's GPU work (`hle_back_frame_pace`) brought swap -> display to
+**19 ms** measured, zero push-buffer faults, same frame rate - the guest
+throttles itself. It is **off by default**: parking the decoder mid-decode
+every flip widened an FEX page-fault race (the guest's write into an
+armed ring page SEGVs in the JIT; it also fired once before the pace
+existed, so it is pre-existing, not caused by it). `debug.hakux.pace = 1`
+enables it for an A/B; the default flips once the FEX fault is fixed.
+
 ### Render scale 0.5x (new): the pixel-bound lever
 
 The app's render scale was integer 1-4x — the one value this GPU needs for
