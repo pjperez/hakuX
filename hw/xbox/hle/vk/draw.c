@@ -2081,7 +2081,10 @@ static HlePbResult pipeline_build(const void *key, const uint32_t *tok, uint32_t
             VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
         VkPipelineInputAssemblyStateCreateInfo ia = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-            .topology = k_class[k->topo_class] };
+            .topology = k_class[k->topo_class],
+            /* Strip batching without eds2: the joined draws' restart comes
+             * from here (vk/batch.c). */
+            .primitiveRestartEnable = !g_hvk.caps.eds2 };
         VkPipelineViewportStateCreateInfo vp = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
             .viewportCount = 1, .scissorCount = 1 };
@@ -2249,8 +2252,8 @@ static void pipe_async_init(void)
     g_key_bytes = !c->eds1 || !c->eds2 ? sizeof(PipeKey)
                   : c->vids ? offsetof(PipeKey, vi) : offsetof(PipeKey, ds);
     static char variant[16];
-    snprintf(variant, sizeof(variant), "%s%s%s", c->vids ? "" : "-vi", c->eds1 ? "" : "-e1",
-             c->eds2 ? "" : "-e2");
+    snprintf(variant, sizeof(variant), "%s%s%s%s", c->vids ? "" : "-vi", c->eds1 ? "" : "-e1",
+             c->eds2 ? "" : "-e2", c->eds2 ? "" : "-br");
     hle_pipe_init(g_key_bytes, pipeline_build, variant);
 }
 
@@ -4189,15 +4192,28 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
          * which this draw's own recording would set off after the check
          * below: the draw then read the run's indices. Nightcaster's terrain
          * lost tiles so, its strips read in place sharing one binding (no
-         * state recorded between them and the indexed draw after). */
-        hle_batch_flush(cb);
+         * state recorded between them and the indexed draw after). A strip
+         * (or fan) draw that can be held is not recorded at all, so it joins
+         * the run instead of flushing it. */
+        const bool bidx = g_hle_gpucut == 0 && !g_probe.nvsh &&
+                          (c->prim == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+                           c->prim == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
+                           c->prim == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP);
+        if (!bidx) {
+            hle_batch_flush(cb);
+        }
         /* 16-bit indices from the arena, bound once: the offset is firstIndex */
         if (REC_CHANGED(ibuf, g_harena.buf)) {
             T.vkCmdBindIndexBuffer(cb, g_harena.buf, 0, VK_INDEX_TYPE_UINT16);
         }
         int q = g_probe.nvsh ? probe_begin(cb, c, vfirst, (uint64_t)(uintptr_t)g_rec.pipe)
                                 : -1;
-        if (g_hle_gpucut != 2) {
+        if (g_hle_gpucut == 2) {
+            /* debug: the state alone */
+        } else if (bidx && hle_batch_draw_idx(cb, (VkPrimitiveTopology)c->prim, c->ib_off,
+                                              c->count, vfirst)) {
+            /* held: recorded with the strips that follow it (a probed draw never is) */
+        } else {
             T.vkCmdDrawIndexed(cb, g_hle_gpucut == 4 ? MIN(c->count, 3u) : c->count, 1,
                                c->ib_off / 2, (int32_t)vfirst, 0);
         }

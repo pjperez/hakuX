@@ -25,6 +25,13 @@ void hle_batch_slot(unsigned slot);
  * later, with the strips that follow it), false to record it now. */
 bool hle_batch_draw(VkCommandBuffer cb, VkPrimitiveTopology prim, uint32_t first, uint32_t count);
 
+/* An indexed strip or fan draw (16-bit indices at ib_off in the arena,
+ * vertexOffset voff): true when held like the non-indexed one above — its
+ * indices are copied into the run's, rebased to the run's vertexOffset, so
+ * gl_VertexIndex keeps the value it had. */
+bool hle_batch_draw_idx(VkCommandBuffer cb, VkPrimitiveTopology prim, uint32_t ib_off,
+                        uint32_t count, uint32_t voff);
+
 /* The run held on cb, recorded now: a run binds its own index buffer, so
  * the draw path records it before relying on the one it bound last. */
 void hle_batch_flush(VkCommandBuffer cb);
