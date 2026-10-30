@@ -54,7 +54,7 @@ Deliberately NOT `+dotprod`/`+rcpc`: the T618's A55 may lack them.
 
 | Game | Menus / attract | Gameplay | Bound by |
 |---|---|---|---|
-| Sega GT 2002 | 50 fps (50 cap) | **13.3 fps in races** | GPU workload: `gpu=963ms/s`, ~74 ms/frame across ~55 cbs — the game's own 640x720 internal passes, shadows and 688 copies/s |
+| Sega GT 2002 | 50 fps (50 cap) | **13.3 fps at 1x; 22-30 fps at 0.5x in a real race (player-measured, 2026-10-30)** | at 1x: GPU workload, `gpu=963ms/s` (~74 ms/frame, the game's own 640x720 internal passes, shadows, 688 copies/s); at 0.5x the pixel work is quartered and what remains is the per-frame floor — ~1120 draws/frame decoded (the mirror's extra scene render included) plus ~55 command buffers a frame |
 | Halo CE | 51 fps | not yet measured | — |
 | Colin McRae 2005 | 48 fps | **48.7 fps measured in a race** (59k draws/s!) | light per-draw work |
 | Doom 3 | 50 fps | not yet measured | — |
