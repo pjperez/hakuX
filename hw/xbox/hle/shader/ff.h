@@ -166,11 +166,16 @@ typedef struct HleFfPush {
     float alpha_ref;                  /* ALPHAREF / 255 */
     uint32_t flags;                   /* bit s: stage s samples a linear texture
                                          (texel coordinates); bit 8 + s: that
-                                         texture is a surface, rendered at the
-                                         resolution scale; bits 16-23: the
-                                         target's scale (point sizes), 24-31:
-                                         the resolution scale (those texels) —
-                                         both in eighths, /8 in the shaders */
+                                         texture is a surface, rendered at a
+                                         scale; bits 16-23: the target's scale
+                                         (point sizes), in eighths (/8 in the
+                                         shaders); bits 24-31: 2 bits a stage,
+                                         that stage's linear surface's own scale
+                                         (0: 1x — small targets stay 1x, 1: 0.5x,
+                                         2: 2x, 3: 4x): the shader divides its
+                                         texel coordinates by it, not by the
+                                         device's scale (they differ for
+                                         guest-resolution surfaces) */
     float zscale;                     /* vertex programs: 1 / depth maximum (2^-n for
                                          the integer formats: HLE_ZNORM_GLSL) */
     uint32_t fog_color;               /* FOGCOLOR (D3DCOLOR) */
@@ -319,6 +324,15 @@ static inline const char *hle_push_glsl(void)
     "  { uint rsc = (pc.flags >> 16) & 255u;\n" \
     "    if (rsc > 8u && (pc.flags & 4096u) == 0u)\n" \
     "      " v " -= vec2(equal(fract(" v "), vec2(0.5))) * (0.5 - 4.0 / float(rsc)); }\n"
+
+/* Stage S's linear surface texture's own scale (2 bits in flags' top byte):
+ * its texel coordinates are divided by this, whatever the device's scale is.
+ * HLE_SSCL_FN_GLSL goes where the shader declares its helpers (it reads pc),
+ * HLE_SSCL_GLSL(s) is the call — s a GLSL expression for the stage. */
+#define HLE_SSCL_FN_GLSL \
+    "float sscl(uint s) { uint c = (pc.flags >> (24u + 2u * s)) & 3u;\n" \
+    "  return c == 1u ? 0.5 : c == 2u ? 2.0 : c == 3u ? 4.0 : 1.0; }\n"
+#define HLE_SSCL_GLSL(s) "sscl(" s ")"
 
 /* GLSL source into buf (NUL-terminated); returns its length, or 0 if it did
  * not fit. */

@@ -2408,7 +2408,15 @@ static unsigned g_rt_told;
  * a swizzled 256 x 256 target through its linear view and blurs it from
  * there with a linear texture, by texel; addressed normalized, as the
  * swizzled object, every tap clamped to the corner and the halo was gone. */
-static uint32_t stage_slot(const HleCmdDraw *c, unsigned st, uint32_t rt_id, uint32_t *flags)
+/* A surface's scale as the 2 bits the shaders read (ff.h HLE_SSCL_GLSL):
+ * 0: 1x (guest-resolution surfaces), 1: 0.5x, 2: 2x, 3: 4x */
+static uint32_t sscl_code(uint32_t e8)
+{
+    return e8 == 4 ? 1 : e8 == 16 ? 2 : e8 == 32 ? 3 : 0;
+}
+
+static uint32_t stage_slot(const HleCmdDraw *c, unsigned st, uint32_t rt_id, uint32_t *flags,
+                           uint32_t *scl)
 {
     HleVkTex *tx = tex_find(c->tex[st]);
     HleVkSurf *ts = tx ? NULL : tex_surface(c->tex[st], rt_id);
@@ -2421,11 +2429,13 @@ static uint32_t stage_slot(const HleCmdDraw *c, unsigned st, uint32_t rt_id, uin
                (rt = hle_surf_get(rt_id)) != NULL) {
         slot = g_snap[g_snap_cur].slot;  /* the target, copied before the draw */
         *flags |= (c->tex_lin >> st & 1) ? (1u << st) | (256u << st) : 0;
+        *scl |= sscl_code(rt->scale) << (2 * st);
         return slot;
     } else if (ts && (ts->general || ts->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)) {
         slot = surf_slot(ts, c->tex_ord >> 2 * st & 3);  /* RT as texture (identity) */
-        /* linear format: texel coords, of a scaled image */
+        /* linear format: texel coords, of the surface's own scale */
         *flags |= (c->tex_lin >> st & 1) ? (1u << st) | (256u << st) : 0;
+        *scl |= sscl_code(ts->scale) << (2 * st);
     }
     uint32_t id = c->tex[st];
     if (id && !tx && id < 8192 && g_rt_told < 64 && !(g_rt_seen[id >> 3] >> (id & 7) & 1)) {
@@ -3426,10 +3436,11 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
         fs->alphaarg1 = t[TSS_ALPHAARG1];
         fs->alphaarg2 = t[TSS_ALPHAARG2];
         fs->resultarg = t[TSS_RESULTARG];
-        uint32_t lin = 0;
+        uint32_t lin = 0, scl = 0;
         /* fixed-function shadow buffers: not yet (white, as before) */
-        uint32_t slot = shadow_fmt(c->tex[st]) ? 0 : stage_slot(c, st, rt_id, &lin);
-        pc.flags |= (lin >> st & 1) << ki | (lin >> (st + 8) & 1) << (ki + 8);
+        uint32_t slot = shadow_fmt(c->tex[st]) ? 0 : stage_slot(c, st, rt_id, &lin, &scl);
+        pc.flags |= (lin >> st & 1) << ki | (lin >> (st + 8) & 1) << (ki + 8) |
+                    (scl >> (2 * st) & 3u) << (2 * ki);
         fs->texture = c->tex[st] != 0;
         fs->unset = c->tex_unset >> st & 1;
         fs->alpha_kill = fs->texture && t[TSS_ALPHAKILL] != 0;
@@ -3445,8 +3456,10 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
         memset(&k.ps, 0, sizeof(k.ps));
         pc.flags = 0;
         for (unsigned st = 0; st < HLE_FF_STAGES; st++) {
-            pc.tex[st] = stage_slot(c, st, rt_id, &pc.flags) |
+            uint32_t sflags = 0, scl = 0;
+            pc.tex[st] = stage_slot(c, st, rt_id, &sflags, &scl) |
                          sampler_index(s->tss[st], stage_lod_down(c, st, rt_id)) << 16;
+            pc.flags |= sflags | scl;
             k.vs.texcoord[st] = s->tss[st][TSS_TEXCOORDINDEX] & 7;
         }
         k.vs.ntex = HLE_FF_STAGES;
@@ -3943,10 +3956,9 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
     pc.zscale = wbuf && wff ? c->wscale : c->zscale;
     pc.tfactor = s->rs[RS_TEXTUREFACTOR];
     pc.alpha_ref = (s->rs[RS_ALPHAREF] & 0xFF) / 255.0f;
-    /* the target's scale (point sizes, texel edges) and linear surfaces'
-     * (always scaled), in eighths (the shaders divide by 8); antialiased:
-     * texel edges as they are (ff.h) */
-    pc.flags |= MIN(rs, 255u) << 16 | MIN(g_hle_rscale, 255u) << 24 |
+    /* the target's scale (point sizes, texel edges), in eighths; bits 24-31
+     * hold each stage's linear surface's own scale (set in stage_slot) */
+    pc.flags |= MIN(rs, 255u) << 16 |
                 (aax > 1.0f || aay > 1.0f ? HLE_TEXEL_EDGE_FLAG : 0u) | (g_snap_trunc ? HLE_SNAP_TRUNC_FLAG : 0u);
     if (!g_hvk.caps.bindless) {
         fixed_bind(cb, &pc);            /* the textures a set of the draw's own */
