@@ -89,7 +89,11 @@ heavy titles (½x) was impossible. It now runs 0.5x-4x: the scale is held in
 so ½x renders every target at half extent with all guest↔host rectangle
 math, scissor/viewport, point sizes, linear-texture UV normalization,
 zread halves and readback/down-blit paths sharing the same denominator.
-Small render-to-texture targets stay exact 1x as before. Set per game:
+Small render-to-texture targets stay exact 1x as before — and a surface
+sampled by texel is now divided by **its own** scale in the shaders
+(flags' top byte holds a 2-bit code a stage), not the device's: the two
+differ for guest-resolution surfaces, which is why Sega GT's cars (64x64
+1x skin targets) first lost their textures at 0.5x. Set per game:
 **game's settings → Resolution scale → 0.5x** (a quarter of the pixels;
 Sega GT 2002 ships with it preset in this build's app data).
 
