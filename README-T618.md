@@ -81,20 +81,28 @@ frame-level only. The generic lever for a pixel-bound title on this GPU is
 below; a per-title mod that kills the cockpit's extra scene render remains
 the surgical fix.
 
-### Input lag: measured at ~1 second, fix proven, off pending an FEX fault
+### Input lag: fixed, on by default (`hle_back_frame_pace`)
 
-The stutter monitor quantified what a race feels like: the guest's flip
-reached the display **1030-1130 ms** later (`swap -1070 write +51` lines)
+The stutter monitor quantified what a race felt like: the guest's flip
+reached the display **1030-1130 ms** later (`swap -1070 write +51`)
 - Sega GT's push ring holds ~25 frames of commands and the game never
 polls for ring space, so it simulated at 50 Hz while the screen showed
-20 fps of frames a second old. Waiting at each flip for the previous
-flip's GPU work (`hle_back_frame_pace`) brought swap -> display to
-**19 ms** measured, zero push-buffer faults, same frame rate - the guest
-throttles itself. It is **off by default**: parking the decoder mid-decode
-every flip widened an FEX page-fault race (the guest's write into an
-armed ring page SEGVs in the JIT; it also fired once before the pace
-existed, so it is pre-existing, not caused by it). `debug.hakux.pace = 1`
-enables it for an A/B; the default flips once the FEX fault is fixed.
+20 fps of frames a second old; the pad was read by a simulation a second
+behind the picture. The pace waits at each flip for the previous flip's
+GPU work: the guest itself throttles to the render pace, **swap -> display
+~2-19 ms** measured, zero push-buffer faults, the same frame rate.
+
+The one non-negotiable: the wait-and-submit runs at the decode loop's
+packet boundary (`hle_back_pace_serve`), never where the flip method is
+processed - a submit mid-packet splits a draw from its own pipeline and
+descriptor binds across two command buffers, and the batch's later draw
+ran on a buffer without them (Mali r34p0 dereferenced freed state).
+`debug.hakux.pace = 0` turns the pace off.
+
+Still open, unrelated: a pre-existing FEX page-fault boot crash (the
+guest's write into an armed ring page SEGVs in the JIT, roughly 1 boot
+in 10 on this device) - it predates the pace and the paced builds did
+not reproduce it.
 
 ### Render scale 0.5x (new): the pixel-bound lever
 
