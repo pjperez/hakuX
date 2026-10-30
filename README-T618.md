@@ -48,16 +48,19 @@ Deliberately NOT `+dotprod`/`+rcpc`: the T618's A55 may lack them.
 
 | Game | Menus / attract | Gameplay | Bound by |
 |---|---|---|---|
-| Sega GT 2002 | 50 fps (50 cap) | **~12 fps in races** | GPU: ~1,700 strip draws/frame, unjoined |
+| Sega GT 2002 | 50 fps (50 cap) | **13.3 fps in races** | GPU workload: `gpu=963ms/s`, ~74 ms/frame across ~55 cbs — the game's own 640x720 internal passes, shadows and 688 copies/s |
 | Halo CE | 51 fps | not yet measured | — |
-| Colin McRae 2005 | 48 fps | not yet measured | — |
+| Colin McRae 2005 | 48 fps | **48.7 fps measured in a race** (59k draws/s!) | light per-draw work |
 | Doom 3 | 50 fps | not yet measured | — |
 | Halo 2 | 29 fps (30 cap) | not yet measured | — |
 | Deus Ex: IW | 25 fps | 25 fps | CPU (FEX JIT of Unreal Warfare) |
 | Beyond Good & Evil | 37 fps first run | not yet measured | cold caches on first run |
 
-Races in Sega GT push 13k–23k draws/s (~1,700/frame) with the Bifrost
-no-descriptor-indexing path binding state per draw: ~80–120 ms/frame.
+Sega GT's races are the clearest case of pixel-workload bound on this GPU:
+Colin McRae pushes 2.7x the draws (59k/s) at 3.7x the framerate (48.7 vs
+13.3), so draw count is not the limit — the race's own render targets are.
+Draw-path work cannot fix that; a per-title mod (the emulator's mods system)
+to cut the reflection passes is the remaining lever.
 
 ## Roadmap
 
