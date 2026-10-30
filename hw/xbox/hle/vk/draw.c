@@ -3781,8 +3781,8 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
             k.ps.fbfetch |= (uint8_t)g_hle_zeq;
         }
     }
-    /* the slope is per guest pixel; the target has scale pixels to one */
-    zslope *= (float)(rt ? rt->scale : ds->scale);
+    /* the slope is per guest pixel; the target has scale/8 pixels to one */
+    zslope *= (float)(rt ? rt->scale : ds->scale) / 8.0f;
     if (wbuf && wff) {
         /* the offsets are in depth-buffer units; vW is w here */
         float f = c->zscale / c->wscale;
@@ -3889,18 +3889,19 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
      * depth range. */
     uint32_t tw = rt ? rt->d.w : ds->d.w, th = rt ? rt->d.h : ds->d.h;
     uint32_t sw = rt ? rt->w : ds->w, sh = rt ? rt->h : ds->h;
-    uint32_t rs = rt ? rt->scale : ds->scale;
+    uint32_t rs = rt ? rt->scale : ds->scale;      /* eighths */
     bool full = !vpc->w || !vpc->h;
     VkRect2D sc = full ? (VkRect2D){ { 0, 0 }, { sw, sh } } :
-                         (VkRect2D){ { (int32_t)(vpc->x * rs), (int32_t)(vpc->y * rs) },
-                                     { vpc->w * rs, vpc->h * rs } };
+                         (VkRect2D){ { (int32_t)hle_rs_px(vpc->x, rs),
+                                       (int32_t)hle_rs_px(vpc->y, rs) },
+                                     { hle_rs_px(vpc->w, rs), hle_rs_px(vpc->h, rs) } };
     if (vpc->clip) {
         /* SetScissors' rectangle replaces the viewport as the clip */
         int32_t x1 = MAX(vpc->cx1, 0), y1 = MAX(vpc->cy1, 0);
         int32_t x2 = MIN(vpc->cx2, (int32_t)tw), y2 = MIN(vpc->cy2, (int32_t)th);
-        sc = (VkRect2D){ { x1 * (int32_t)rs, y1 * (int32_t)rs },
-                         { x2 > x1 ? (uint32_t)(x2 - x1) * rs : 0,
-                           y2 > y1 ? (uint32_t)(y2 - y1) * rs : 0 } };
+        sc = (VkRect2D){ { x1 * (int32_t)rs / 8, y1 * (int32_t)rs / 8 },
+                         { x2 > x1 ? hle_rs_px((uint32_t)(x2 - x1), rs) : 0,
+                           y2 > y1 ? hle_rs_px((uint32_t)(y2 - y1), rs) : 0 } };
     }
     if (g_hle_gpucut == 1 || g_hle_gpucut == 4) {
         sc = (VkRect2D){ { 0, 0 }, { 1, 1 } };  /* debug: next to no fragments */
@@ -3943,7 +3944,8 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
     pc.tfactor = s->rs[RS_TEXTUREFACTOR];
     pc.alpha_ref = (s->rs[RS_ALPHAREF] & 0xFF) / 255.0f;
     /* the target's scale (point sizes, texel edges) and linear surfaces'
-     * (always scaled); antialiased: texel edges as they are (ff.h) */
+     * (always scaled), in eighths (the shaders divide by 8); antialiased:
+     * texel edges as they are (ff.h) */
     pc.flags |= MIN(rs, 255u) << 16 | MIN(g_hle_rscale, 255u) << 24 |
                 (aax > 1.0f || aay > 1.0f ? HLE_TEXEL_EDGE_FLAG : 0u) | (g_snap_trunc ? HLE_SNAP_TRUNC_FLAG : 0u);
     if (!g_hvk.caps.bindless) {

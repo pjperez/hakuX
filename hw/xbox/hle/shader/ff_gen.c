@@ -203,7 +203,8 @@ size_t hle_ff_vs_glsl(const HleFfVsKey *k, char *buf, size_t cap)
                     "f[%u].z * d * d, 1e-12));\n", P, P + 1, P + 1, P + 1);
         }
         put(&b, "    gl_PointSize = clamp(ps, f[%u].y, f[%u].z) * f[%u].w *\n"
-                "                   float(max((pc.flags >> 16) & 255u, 1u)); }\n", P, P, P + 1);
+                "                   (float(max((pc.flags >> 16) & 255u, 1u)) / 8.0); }\n",
+            P, P, P + 1);
     }
     /* lighting (D3D8 fixed function) */
     if (xf && k->lighting) {
@@ -536,7 +537,7 @@ size_t hle_ff_ps_glsl(const HleFfPsKey *k, char *buf, size_t cap)
                 put(&b, "  vec2 uv%u = nvproj(vTex%u).xy;\n"
                         "  if ((pc.flags & %uu) != 0u) uv%u /= vec2(textureSize(sampler2D("
                         "uTex2D[nonuniformEXT(pc.tex[%u] & 0xFFFFu)], uSmp[0]), 0)) /\n"
-                        "      ((pc.flags & %uu) != 0u ? float(pc.flags >> 24) : 1.0);\n",
+                        "      ((pc.flags & %uu) != 0u ? float(pc.flags >> 24) / 8.0 : 1.0);\n",
                     s, s, 1u << s, s, s, 256u << s);
             }
             put(&b, "  vec4 t%u = texture(sampler2D(uTex2D[nonuniformEXT(pc.tex[%u] & 0xFFFFu)], "

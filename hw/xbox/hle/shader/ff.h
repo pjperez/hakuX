@@ -169,7 +169,8 @@ typedef struct HleFfPush {
                                          texture is a surface, rendered at the
                                          resolution scale; bits 16-23: the
                                          target's scale (point sizes), 24-31:
-                                         the resolution scale (those texels) */
+                                         the resolution scale (those texels) —
+                                         both in eighths, /8 in the shaders */
     float zscale;                     /* vertex programs: 1 / depth maximum (2^-n for
                                          the integer formats: HLE_ZNORM_GLSL) */
     uint32_t fog_color;               /* FOGCOLOR (D3DCOLOR) */
@@ -316,8 +317,8 @@ static inline const char *hle_push_glsl(void)
 #define HLE_TEXEL_EDGE_FLAG 4096u
 #define HLE_TEXEL_EDGE_GLSL(v) \
     "  { uint rsc = (pc.flags >> 16) & 255u;\n" \
-    "    if (rsc > 1u && (pc.flags & 4096u) == 0u)\n" \
-    "      " v " -= vec2(equal(fract(" v "), vec2(0.5))) * (0.5 - 0.5 / float(rsc)); }\n"
+    "    if (rsc > 8u && (pc.flags & 4096u) == 0u)\n" \
+    "      " v " -= vec2(equal(fract(" v "), vec2(0.5))) * (0.5 - 4.0 / float(rsc)); }\n"
 
 /* GLSL source into buf (NUL-terminated); returns its length, or 0 if it did
  * not fit. */

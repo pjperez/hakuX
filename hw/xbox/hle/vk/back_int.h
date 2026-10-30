@@ -20,12 +20,17 @@ VkResult hle_tl_sem_wait(VkSemaphore sem, uint64_t value, uint64_t timeout_ns);
  * (hle_tl_gap, back.h). */
 void hle_tl_gap_serve(void);
 
-/* Resolution scale (the surface_scale setting, 1-4, read at DEVICE_CREATE):
- * every render target and depth surface is rendered at d.w * scale by
- * d.h * scale. Guest-facing values stay in guest pixels (D3D viewports,
+/* Resolution scale (the surface_scale setting, 0.5-4, read at DEVICE_CREATE),
+ * held in eighths of a guest pixel: 4 = 0.5x, 8 = 1x, 16 = 2x ... 32 = 4x.
+ * Every render target and depth surface is rendered at d.w * scale / 8 by
+ * d.h * scale / 8. Guest-facing values stay in guest pixels (D3D viewports,
  * clear rects, readbacks, visibility counts) and are converted where the
- * image is used. */
+ * image is used (hle_rs_px: the two axes share the denominator). */
 extern uint32_t g_hle_rscale;
+static inline uint32_t hle_rs_px(uint32_t guest, uint32_t e8)
+{
+    return guest * e8 / 8u;
+}
 
 /* surf.c */
 typedef struct HleVkSurf {
@@ -33,7 +38,7 @@ typedef struct HleVkSurf {
     uint32_t id;
     HleSurfDesc d;
     uint32_t w, h;              /* image extent (views: their level's), scaled */
-    uint32_t scale;             /* host pixels per guest pixel (hle_surf_define) */
+    uint32_t scale;             /* host pixels per guest pixel, in eighths (hle_surf_define) */
     VkFormat fmt;
     VkImageAspectFlags aspect;
     uint32_t texel_bytes;

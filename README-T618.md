@@ -43,6 +43,12 @@ Deliberately NOT `+dotprod`/`+rcpc`: the T618's A55 may lack them.
   `vkGetSemaphoreCounterValue` in userspace instead. Zero device losses in
   ~40 min of testing after; measured cost nil (7 timeline waits in a whole
   race session).
+- **`no_timestamps` extended to this G52 (r34p0).** The quirk existed for
+  Mali-G615 ("timestamp queries never resolve"); this driver has the same
+  failure — a 60 s profile created both query pools and armed them, and not
+  one per-pass or whole-cb GPU time came back while the counter-free pass
+  histogram logged every second. Without the quirk the profiler silently
+  produces no timing data instead of none at all.
 
 ## Device performance ledger (measured, 2026-10-30)
 
@@ -59,14 +65,33 @@ Deliberately NOT `+dotprod`/`+rcpc`: the T618's A55 may lack them.
 Sega GT's races are the clearest case of pixel-workload bound on this GPU:
 Colin McRae pushes 2.7x the draws (59k/s) at 3.7x the framerate (48.7 vs
 13.3), so draw count is not the limit — the race's own render targets are.
-Camera-measured (player A/B, 10s buckets): internal view 12.4 fps, external
-15.8-17.6 — and the external view submits MORE draws per second while both
-submit the same ~1000 draws / ~37k verts per FRAME. The internal view's
-extra ~17 ms/frame is per-pixel work a cockpit-only effect pays (windshield
-glass / full-screen overlay class), not geometry, not the visible car, not
-a mirror scene re-render. Draw-path work cannot fix that; a per-title mod
-(the emulator's mods system) that kills the cockpit's full-screen pass is
-the remaining lever.
+Camera-measured (player A/B, clean windows): **internal view 12.4 fps,
+external view ~48.7 fps** — both submitting the same ~1000 draws / ~37k
+verts per FRAME, GPU near-fully busy in both (77 ms vs 20 ms of work per
+frame). The cockpit pays ~58 ms/frame in extra per-pixel work.
+
+Per-frame counter diff (internal vs external, from the session logs):
+**+560 draws, +5 target clears, +7 semaphore syncs, +9 traps per frame** —
+a whole extra scene render plus its own clear-bounded targets, exactly the
+shape of a rear-view mirror pass rendered from a second camera. Per-pass
+GPU timing would name it directly, but this driver's timestamp queries
+never resolve (see the no_timestamps quirk below), so the pass-level
+profiler has never produced data on this device — every profile so far was
+frame-level only. The generic lever for a pixel-bound title on this GPU is
+below; a per-title mod that kills the cockpit's extra scene render remains
+the surgical fix.
+
+### Render scale 0.5x (new): the pixel-bound lever
+
+The app's render scale was integer 1-4x — the one value this GPU needs for
+heavy titles (½x) was impossible. It now runs 0.5x-4x: the scale is held in
+**eighths of a guest pixel** end to end (`g_hle_rscale`, `HleVkSurf.scale`),
+so ½x renders every target at half extent with all guest↔host rectangle
+math, scissor/viewport, point sizes, linear-texture UV normalization,
+zread halves and readback/down-blit paths sharing the same denominator.
+Small render-to-texture targets stay exact 1x as before. Set per game:
+**game's settings → Resolution scale → 0.5x** (a quarter of the pixels;
+Sega GT 2002 ships with it preset in this build's app data).
 
 ## Roadmap
 

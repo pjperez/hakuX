@@ -245,8 +245,9 @@ static void shadow_sample(Buf *b, const HlePshKey *k, unsigned s, bool project3d
            "    vec2 uv = pq.xy;\n"
            "    vec2 sz = vec2(textureSize(sampler2D(uTex2D[nonuniformEXT(ti)], uSmp[0]), 0));\n"
            "    if ((pc.flags & (1u << %uu)) != 0u)\n"
-           /* a scaled surface's texel coordinates: sz / the resolution scale */
-           "      uv /= sz / ((pc.flags & (256u << %uu)) != 0u ? float(pc.flags >> 24) : 1.0);\n"
+           /* a scaled surface's texel coordinates: sz / the resolution scale
+            * (the scale is packed in eighths: divide by 8) */
+           "      uv /= sz / ((pc.flags & (256u << %uu)) != 0u ? float(pc.flags >> 24) / 8.0 : 1.0);\n"
            "    float m = %s, r = %s;\n"
            "    vec4 d = textureGather(sampler2D(uTex2D[nonuniformEXT(ti)], "
            "uSmp[nonuniformEXT(si)]), uv) * m;\n"
@@ -298,7 +299,7 @@ size_t hle_psh_glsl(const HlePshKey *k, char *buf, size_t cap, unsigned *unsuppo
             "  uint ti = pc.tex[s] & 0xFFFFu, si = pc.tex[s] >> 16;\n"
             "  if ((pc.flags & (1u << s)) != 0u)\n"
             "    uv /= vec2(textureSize(sampler2D(uTex2D[nonuniformEXT(ti)], uSmp[0]), 0)) /\n"
-            "          ((pc.flags & (256u << s)) != 0u ? float(pc.flags >> 24) : 1.0);\n"
+            "          ((pc.flags & (256u << s)) != 0u ? float(pc.flags >> 24) / 8.0 : 1.0);\n"
             "  return texture(sampler2D(uTex2D[nonuniformEXT(ti)], uSmp[nonuniformEXT(si)]), uv);\n"
             "}\n"
             "vec4 samp3(uint s, vec3 uvw) {\n"

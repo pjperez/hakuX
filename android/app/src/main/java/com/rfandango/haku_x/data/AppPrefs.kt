@@ -80,10 +80,14 @@ class AppPrefs(context: Context) {
     get() = sp.getBoolean(NativeCoreActivity.PREF_SHOW_HITCHES, true)
     set(value) = sp.edit { putBoolean(NativeCoreActivity.PREF_SHOW_HITCHES, value) }
 
-  /** The HLE GPU's render scale, 1-4x the title's resolution (read at game start). */
-  var renderScale: Int
-    get() = sp.getInt(NativeCoreActivity.PREF_SCALE, NativeCoreActivity.DEFAULT_SCALE)
-    set(value) = sp.edit { putInt(NativeCoreActivity.PREF_SCALE, value) }
+  /** The HLE GPU's render scale, 0.5-4x the title's resolution (read at game
+   * start). Kept as the option's string so 0.5 survives the round trip; an
+   * older install's int value falls back to the default. */
+  var renderScale: String
+    get() = runCatching {
+      sp.getString(NativeCoreActivity.PREF_SCALE, NativeCoreActivity.DEFAULT_SCALE.toString())
+    }.getOrNull() ?: NativeCoreActivity.DEFAULT_SCALE.toString()
+    set(value) = sp.edit { putString(NativeCoreActivity.PREF_SCALE, value) }
 
   /** The picture's shape: auto, 4:3, 16:9 or stretch (read at game start). */
   var aspectRatio: String

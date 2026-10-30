@@ -49,7 +49,7 @@ private val SECTIONS: List<Pair<Int, List<Overridable>>> = listOf(
     Overridable(GameSetting.ASPECT, R.string.settings_aspect, ASPECTS, { it.aspectRatio }, { stringResource(aspectLabel(it)) }),
   ),
   R.string.settings_section_graphics to listOf(
-    Overridable(GameSetting.RENDER_SCALE, R.string.settings_scale, SCALES.map { "$it" }, { it.renderScale.toString() }, { scaleLabel(it.toInt()) }),
+    Overridable(GameSetting.RENDER_SCALE, R.string.settings_scale, SCALES, { it.renderScale }, { scaleLabel(it) }),
     Overridable(GameSetting.FXAA, R.string.settings_fxaa, ON_OFF, { it.fxaa.toString() }, { onOff(it) }),
     Overridable(GameSetting.UPSCALE, R.string.settings_upscale, UPSCALERS, { it.upscaleFilter }, { stringResource(upscaleLabel(it)) }),
     Overridable(GameSetting.ASYNC_SHADERS, R.string.settings_async_shaders, ON_OFF, { it.asyncShaders.toString() }, { onOff(it) }),

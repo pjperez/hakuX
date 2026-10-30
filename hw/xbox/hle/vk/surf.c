@@ -79,7 +79,7 @@ static uint32_t surf_scale(const HleSurfDesc *d, VkImageAspectFlags aspect)
     bool small = !d->role && !d->pitch && !d->parent && d->levels <= 1 && d->faces <= 1 &&
                  (aspect & VK_IMAGE_ASPECT_COLOR_BIT) &&
                  MAX(d->w, d->h) <= SURF_UNSCALED_MAX;
-    return small ? 1 : g_hle_rscale;
+    return small ? 8u : g_hle_rscale;      /* 8 eighths = exactly 1x */
 }
 
 static uint32_t sub_bit(const HleVkSurf *o, uint32_t level, uint32_t face)
@@ -272,8 +272,8 @@ HleVkSurf *hle_surf_define(const HleSurfDesc *d)
             s->d = *d;
             s->fmt = surf_format(d->xfmt, &s->aspect, &s->texel_bytes);
             s->scale = surf_scale(d, s->aspect);
-            s->w = d->w * s->scale;
-            s->h = d->h * s->scale;
+            s->w = MAX(hle_rs_px(d->w, s->scale), 1u);
+            s->h = MAX(hle_rs_px(d->h, s->scale), 1u);
             s->layout = VK_IMAGE_LAYOUT_UNDEFINED;
             s->general = d->parent || owner_kind(d);
             s->nlevels = s->nfaces = 1;

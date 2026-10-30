@@ -76,6 +76,21 @@ static bool mali_g615(const HleDriver *d)
     return mali(d) && strstr(d->props.deviceName, "Mali-G615") != NULL;
 }
 
+/* The RG Vita's Mali-G52 (r34p0): timestamp queries are legal to write but
+ * their results never resolve. A 60 s profile armed the pass timers and the
+ * whole-cb GPU timer (the pools were created): not one "pass #" or "gpu="
+ * line came back, while the counter-free pass histogram logged every second.
+ * Without the quirk the profiler silently produces no timing data. */
+static bool mali_g52_r34(const HleDriver *d)
+{
+    return mali(d) && strstr(d->props.deviceName, "Mali-G52") != NULL;
+}
+
+static bool mali_g615_or_g52_r34(const HleDriver *d)
+{
+    return mali_g615(d) || mali_g52_r34(d);
+}
+
 /* Seen on (driver, version, what showed it). */
 static const HleQuirk k_quirks[] = {
     /* Adreno 840 stock driver 0x8034a02c: Forza's menu text picks its glyph
@@ -107,8 +122,9 @@ static const HleQuirk k_quirks[] = {
     { HLE_QUIRK_FRESH_CLEAR, "fresh_clear", not_adreno },
     /* ARMSX2 (VKSwapChain.cpp) after PPSSPP: older PowerVR swapchain widths */
     { HLE_QUIRK_SWAP_W32, "swap_w32", powervr_old },
-    /* ARMSX2: "Mali-G615's timestamp queries never resolve" */
-    { HLE_QUIRK_NO_TIMESTAMPS, "no_timestamps", mali_g615 },
+    /* ARMSX2: "Mali-G615's timestamp queries never resolve"; the G52 r34p0
+     * below is the same failure, measured (the predicate's comment) */
+    { HLE_QUIRK_NO_TIMESTAMPS, "no_timestamps", mali_g615_or_g52_r34 },
     /* Qualcomm's driver: a present waiting on the pass's semaphore waited
      * 3-6 ms a refresh in the driver, the queue's lock held (Halo 2).
      * Turnip's makes a sync file and returns (Mesa vk_android.c); the other
