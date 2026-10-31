@@ -39,6 +39,8 @@ void nc_hle_set_vk_loader(void *gipa);
 /* Before boot: the HLE GPU's render scale, in eighths of a guest pixel
  * (4 = 0.5x .. 32 = 4x the title's resolution). */
 void nc_hle_set_render_scale(int scale);
+/* Before boot: the decoder's frame pace (the app's "Frame pacing" setting). */
+void nc_hle_set_frame_pace(int on);
 /* Before boot: the app's "Asynchronous shader compilation" and "Build cached
  * shaders before starting" settings (hw/xbox/hle/vk/pipeasync.h). */
 void nc_hle_set_pipeline_options(bool async, bool prebuild);
