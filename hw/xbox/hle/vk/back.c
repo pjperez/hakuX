@@ -173,7 +173,7 @@ static void cmd_vis_end(const HleCmdVis *c)
     p->index = c->index;
     HleVkSurf *vrt = hle_surf_get(g_back.rt);
     uint32_t vsc = vrt ? vrt->scale : g_hle_rscale;
-    p->div = MAX(c->div, 1u) * vsc * vsc;               /* guest pixels */
+    p->div = MAX(c->div, 1u) * vsc * vsc / 64u;       /* guest pixels (scale in eighths) */
     p->report = c->report;
     p->expect = c->expect;
     p->nparts = g_vis.nparts;
@@ -843,11 +843,12 @@ static void flush_idle(void)
     hle_vk_check(r, "vkQueueWaitIdle");
 }
 
-uint32_t g_hle_rscale = 1;
+uint32_t g_hle_rscale = 8;             /* eighths: 8 = 1x */
 
 static void cmd_device(const HleCmdDevice *c, bool reset)
 {
-    uint32_t scale = MIN(MAX(hle_host_render_scale(), 1), 4);
+    /* eighths, 0.5x .. 4x (host_native.c clamps the same way) */
+    uint32_t scale = MIN(MAX(hle_host_render_scale(), 4u), 32u);
     /* A Reset replaces only the device's surfaces (the front end destroys the
      * old ones by OBJ_DESTROY): the title's own render targets and textures
      * keep their images. A new scale resizes every image. */
@@ -864,8 +865,8 @@ static void cmd_device(const HleCmdDevice *c, bool reset)
     g_back.disp_w = c->disp_w;
     g_back.disp_h = c->disp_h;
     g_back.present_id = c->present_id;
-    hle_disp_init(c->disp_w * scale, c->disp_h * scale);
-    hle_log("hakuX-hle-back", "DEVICE_%s %ux%u surfaces=%u present=%u scale=%u",
+    hle_disp_init(hle_rs_px(c->disp_w, scale), hle_rs_px(c->disp_h, scale));
+    hle_log("hakuX-hle-back", "DEVICE_%s %ux%u surfaces=%u present=%u scale=%u/8",
             reset ? "RESET" : "CREATE", c->disp_w, c->disp_h, c->nsurf, c->present_id,
             scale);
 }
@@ -1183,10 +1184,11 @@ static void pix_after(const HleCmdDraw *c)
     if (!g_pix.active || !g_pix.buf || !rtd_surf_ok(rt)) {
         return;
     }
-    /* the texel, and the pixel of the target's image */
-    uint32_t sc = rt->scale, gx = g_pix.host ? g_pix.x / sc : g_pix.x;
-    uint32_t gy = g_pix.host ? g_pix.y / sc : g_pix.y;
-    uint32_t px = g_pix.host ? g_pix.x : g_pix.x * sc, py = g_pix.host ? g_pix.y : g_pix.y * sc;
+    /* the texel, and the pixel of the target's image (scale in eighths) */
+    uint32_t sc = rt->scale, gx = g_pix.host ? g_pix.x * 8u / sc : g_pix.x;
+    uint32_t gy = g_pix.host ? g_pix.y * 8u / sc : g_pix.y;
+    uint32_t px = g_pix.host ? g_pix.x : g_pix.x * sc / 8u,
+             py = g_pix.host ? g_pix.y : g_pix.y * sc / 8u;
     if ((g_pix.id && g_back.rt != g_pix.id) || gx >= rt->d.w || gy >= rt->d.h) {
         return;
     }
@@ -1546,10 +1548,10 @@ static bool clear_masked(const HleCmdClear *c, HleVkSurf *rt, HleVkSurf *ds, uin
     for (uint32_t i = 0; i < MAX(c->nrects, 1u) && i < HLE_CMD_MAX_RECTS; i++) {
         VkRect2D r = { { 0, 0 }, { w, h } };
         if (c->nrects) {
-            int32_t x1 = MAX(c->rect[i].x1 * (int32_t)sc, 0);
-            int32_t y1 = MAX(c->rect[i].y1 * (int32_t)sc, 0);
-            int32_t x2 = MIN(c->rect[i].x2 * (int32_t)sc, (int32_t)w);
-            int32_t y2 = MIN(c->rect[i].y2 * (int32_t)sc, (int32_t)h);
+            int32_t x1 = MAX(c->rect[i].x1 * (int32_t)sc / 8, 0);
+            int32_t y1 = MAX(c->rect[i].y1 * (int32_t)sc / 8, 0);
+            int32_t x2 = MIN(c->rect[i].x2 * (int32_t)sc / 8, (int32_t)w);
+            int32_t y2 = MIN(c->rect[i].y2 * (int32_t)sc / 8, (int32_t)h);
             if (x2 <= x1 || y2 <= y1) {
                 continue;
             }
@@ -1654,9 +1656,10 @@ static void cmd_clear(const HleCmdClear *c)
         rects[nr++] = (VkClearRect){ { { 0, 0 }, { w, h } }, 0, 1 };
     }
     for (uint32_t i = 0; i < c->nrects && i < HLE_CMD_MAX_RECTS; i++) {
-        int32_t x1 = MAX(c->rect[i].x1 * sc, 0), y1 = MAX(c->rect[i].y1 * sc, 0);
-        int32_t x2 = MIN(c->rect[i].x2 * sc, (int32_t)w);
-        int32_t y2 = MIN(c->rect[i].y2 * sc, (int32_t)h);
+        /* sc is eighths: guest rectangles to image pixels */
+        int32_t x1 = MAX(c->rect[i].x1 * sc / 8, 0), y1 = MAX(c->rect[i].y1 * sc / 8, 0);
+        int32_t x2 = MIN(c->rect[i].x2 * sc / 8, (int32_t)w);
+        int32_t y2 = MIN(c->rect[i].y2 * sc / 8, (int32_t)h);
         if (x2 > x1 && y2 > y1) {
             rects[nr++] = (VkClearRect){ { { x1, y1 },
                                            { (uint32_t)(x2 - x1), (uint32_t)(y2 - y1) } },
@@ -1989,8 +1992,8 @@ static void cmd_swap_present(const HleCmdSwap *c)
         uint32_t dw, dh;
         hle_disp_size(&dw, &dh);
         /* the part of src shown (HleCmdSwap.src_w / src_h), in its pixels */
-        const uint32_t sw = c->src_w ? MIN(src->w, c->src_w * src->scale) : src->w;
-        const uint32_t sh = c->src_h ? MIN(src->h, c->src_h * src->scale) : src->h;
+        const uint32_t sw = c->src_w ? MIN(src->w, hle_rs_px(c->src_w, src->scale)) : src->w;
+        const uint32_t sh = c->src_h ? MIN(src->h, hle_rs_px(c->src_h, src->scale)) : src->h;
         if (!g_gamma.identity && !g_gamma.off && !hle_disp_gamma_consumer() &&
             hle_gamma_pass(cb, g_back.cur, g_gamma.rgb, src, sw, sh, dst, dw, dh)) {
             overlay_blit(cb, dst, dw, dh);
@@ -2046,7 +2049,7 @@ static bool readback_packed(const HleCmdReadback *c, VkBuffer buf, VkDeviceSize 
     hle_surf_transition(cb, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkImage img = o->img;
     VkImageLayout il = o->general ? VK_IMAGE_LAYOUT_GENERAL : o->layout;
-    if (o->scale > 1) {                         /* the guest gets guest-size texels */
+    if (o->scale != 8u) {                       /* the guest gets guest-size texels */
         img = hle_surf_down(cb, o, il, level, layer, c->w, c->h);
         if (!img) {
             return false;
@@ -2116,7 +2119,7 @@ static void cmd_readback(const HleCmdReadback *c)
         hle_surf_transition(cb, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         VkImage img = s->img;
         VkImageLayout il = s->layout;
-        if (s->scale > 1 || w != s->d.w || h != s->d.h) {
+        if (s->scale != 8u || w != s->d.w || h != s->d.h) {
             /* the guest gets guest-size pixels (or the size asked for:
              * a multisampled display persisted at display size) */
             img = hle_surf_down(cb, s, il, 0, 0, w, h);
@@ -2211,27 +2214,28 @@ static void cmd_copy(const HleCmdCopy *c)
         g_back.st.copies++;
         return;
     }
-    int32_t k = (int32_t)s->scale, kd = (int32_t)d->scale;
+    int32_t k = (int32_t)s->scale, kd = (int32_t)d->scale;   /* eighths */
     uint32_t n = 0;
     for (uint32_t i = 0; i < c->nrects && i < HLE_CMD_MAX_RECTS; i++) {
         const HleRect *r = &c->rect[i];
-        int32_t w = MIN(MIN(r->x2, (int32_t)s->w / k) - r->x1, (int32_t)d->w / kd - c->x[i]);
-        int32_t h = MIN(MIN(r->y2, (int32_t)s->h / k) - r->y1, (int32_t)d->h / kd - c->y[i]);
+        int32_t w = MIN(MIN(r->x2, (int32_t)s->w * 8 / k) - r->x1, (int32_t)d->w * 8 / kd - c->x[i]);
+        int32_t h = MIN(MIN(r->y2, (int32_t)s->h * 8 / k) - r->y1, (int32_t)d->h * 8 / kd - c->y[i]);
         if (r->x1 < 0 || r->y1 < 0 || c->x[i] < 0 || c->y[i] < 0 || w <= 0 || h <= 0) {
             continue;
         }
         cr[n] = (VkImageCopy2){
             .sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2,
-            .srcSubresource = ss, .srcOffset = { r->x1 * k, r->y1 * k, 0 },
-            .dstSubresource = ds, .dstOffset = { c->x[i] * k, c->y[i] * k, 0 },
-            .extent = { (uint32_t)(w * k), (uint32_t)(h * k), 1 } };
+            .srcSubresource = ss, .srcOffset = { r->x1 * k / 8, r->y1 * k / 8, 0 },
+            .dstSubresource = ds, .dstOffset = { c->x[i] * k / 8, c->y[i] * k / 8, 0 },
+            .extent = { (uint32_t)(w * k / 8), (uint32_t)(h * k / 8), 1 } };
         br[n] = (VkImageBlit2){
             .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
             .srcSubresource = ss,
-            .srcOffsets = { { r->x1 * k, r->y1 * k, 0 }, { (r->x1 + w) * k, (r->y1 + h) * k, 1 } },
+            .srcOffsets = { { r->x1 * k / 8, r->y1 * k / 8, 0 },
+                            { (r->x1 + w) * k / 8, (r->y1 + h) * k / 8, 1 } },
             .dstSubresource = ds,
-            .dstOffsets = { { c->x[i] * kd, c->y[i] * kd, 0 },
-                            { (c->x[i] + w) * kd, (c->y[i] + h) * kd, 1 } } };
+            .dstOffsets = { { c->x[i] * kd / 8, c->y[i] * kd / 8, 0 },
+                            { (c->x[i] + w) * kd / 8, (c->y[i] + h) * kd / 8, 1 } } };
         n++;
     }
     if (!n) {
@@ -2272,12 +2276,13 @@ static void cmd_upload(const HleCmdUpload *c)
                       d->d.parent ? "a level or face" : !hle_surf_ensure(d) ? "no image" :
                       !(d->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? "not colour" :
                       !d->texel_bytes || c->pitch % d->texel_bytes ? "pitch" : NULL;
-    int32_t k = d ? (int32_t)MAX(d->scale, 1u) : 1, n = 0;
+    int32_t k = d ? (int32_t)MAX(d->scale, 4u) : 8;      /* eighths */
+    uint32_t n = 0;
     VkCommandBuffer cb = why ? VK_NULL_HANDLE : cb_get();
     for (uint32_t i = 0; !why && i < c->nrects && i < HLE_CMD_MAX_RECTS; i++) {
         const HleRect *r = &c->rect[i];
-        int32_t w = MIN(r->x2 - r->x1, (int32_t)d->w / k - c->x[i]);
-        int32_t h = MIN(r->y2 - r->y1, (int32_t)d->h / k - c->y[i]);
+        int32_t w = MIN(r->x2 - r->x1, (int32_t)d->w * 8 / k - c->x[i]);
+        int32_t h = MIN(r->y2 - r->y1, (int32_t)d->h * 8 / k - c->y[i]);
         if (r->x1 < 0 || r->y1 < 0 || c->x[i] < 0 || c->y[i] < 0 || w <= 0 || h <= 0) {
             continue;
         }
@@ -2306,8 +2311,8 @@ static void cmd_upload(const HleCmdUpload *c)
             .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .srcOffsets = { { 0, 0, 0 }, { w, h, 1 } },
             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .dstOffsets = { { c->x[i] * k, c->y[i] * k, 0 },
-                            { (c->x[i] + w) * k, (c->y[i] + h) * k, 1 } } };
+            .dstOffsets = { { c->x[i] * k / 8, c->y[i] * k / 8, 0 },
+                            { (c->x[i] + w) * k / 8, (c->y[i] + h) * k / 8, 1 } } };
         VkBlitImageInfo2 bi = {
             .sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
             .srcImage = tmp, .srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,

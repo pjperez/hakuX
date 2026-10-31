@@ -87,7 +87,7 @@ fun SettingsScreen(
   var consoleTiming by remember { mutableStateOf(prefs.consoleTiming) }
   var showFps by remember { mutableStateOf(prefs.showFps) }
   var showHitches by remember { mutableStateOf(prefs.showHitches) }
-  var scale by remember { mutableIntStateOf(prefs.renderScale) }
+  var scale by remember { mutableStateOf(prefs.renderScale) }
   var aspect by remember { mutableStateOf(prefs.aspectRatio) }
   var fxaa by remember { mutableStateOf(prefs.fxaa) }
   var upscale by remember { mutableStateOf(prefs.upscaleFilter) }
@@ -495,11 +495,14 @@ private fun themeLabel(value: String) = when (value) {
   else -> R.string.settings_theme_system
 }
 
-/** The render scales: native, then 2x to 4x. */
-internal val SCALES = (1..4).toList()
+/** The render scales: half (slow GPUs), native, then 2x to 4x. */
+internal val SCALES = listOf("0.5", "1", "2", "3", "4")
 
 @Composable
-internal fun scaleLabel(value: Int) = if (value == 1) stringResource(R.string.settings_scale_native) else "${value}x"
+internal fun scaleLabel(value: String) = when (value) {
+  "1" -> stringResource(R.string.settings_scale_native)
+  else -> "${value}x"
+}
 
 internal val ASPECTS = listOf("auto", "4:3", "16:9", "stretch")
 

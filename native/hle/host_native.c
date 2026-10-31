@@ -149,11 +149,13 @@ const char *hle_host_base_path(void)
     return path;
 }
 
-static int g_render_scale = 1;
+/* Render scale in eighths of a guest pixel: 4 = 0.5x, 8 = 1x, 16 = 2x,
+ * up to 32 = 4x (back_int.h converts; options.c parses "0.5" .. "4"). */
+static int g_render_scale = 8;
 
 void nc_hle_set_render_scale(int scale)
 {
-    g_render_scale = scale < 1 ? 1 : scale > 4 ? 4 : scale;
+    g_render_scale = scale < 4 ? 4 : scale > 32 ? 32 : scale;
 }
 
 int hle_host_render_scale(void)

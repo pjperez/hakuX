@@ -45,7 +45,8 @@ bool nc_option(NcOptions *o, const char *arg)
     } else if ((v = value(arg, "pace="))) {
         nc_hle_set_frame_pace(atoi(v));
     } else if ((v = value(arg, "scale="))) {
-        nc_hle_set_render_scale(atoi(v));
+        /* 0.5 .. 4, kept in eighths (host_native.c) */
+        nc_hle_set_render_scale((int)(atof(v) * 8.0 + 0.5));
         nc_log("hakuX-app", "render scale %sx", v);
     } else if ((v = value(arg, "asyncpipe="))) {
         o->async_pipe = atoi(v) != 0;
