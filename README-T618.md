@@ -97,7 +97,7 @@ packet boundary (`hle_back_pace_serve`), never where the flip method is
 processed - a submit mid-packet splits a draw from its own pipeline and
 descriptor binds across two command buffers, and the batch's later draw
 ran on a buffer without them (Mali r34p0 dereferenced freed state).
-`debug.hakux.pace = 0` turns the pace off.
+It is the app's **Frame pacing** setting (on by default, next to Uncapped frame rate); `debug.hakux.pace = 0` still overrides for an A/B.
 
 Still open, unrelated: a pre-existing FEX page-fault boot crash (the
 guest's write into an armed ring page SEGVs in the JIT, roughly 1 boot
