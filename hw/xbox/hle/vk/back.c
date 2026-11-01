@@ -2491,10 +2491,15 @@ static void cmd_upload(const HleCmdUpload *c)
 {
     close_pass();
     HleVkSurf *d = hle_surf_get(c->dst);
+    /* A level or face of a texture target (a view: d.parent) is written
+     * in its owner's image, at its level and layer */
+    HleVkSurf *o = d && d->d.parent ? hle_surf_get(d->d.parent) : d;
     const char *why = !d ? "no surface" : !g_hram.zero_copy && !c->arena ? "guest RAM not mapped" :
-                      d->d.parent ? "a level or face" : !hle_surf_ensure(d) ? "no image" :
+                      !o ? "no owner" : !hle_surf_ensure(d) || !hle_surf_ensure(o) ? "no image" :
                       !(d->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? "not colour" :
                       !d->texel_bytes || c->pitch % d->texel_bytes ? "pitch" : NULL;
+    const uint32_t level = d && d->d.parent ? d->d.level : 0;
+    const uint32_t layer = d && d->d.parent ? d->d.face : 0;
     int32_t k = d ? (int32_t)MAX(d->scale, 4u) : 8;      /* eighths */
     uint32_t n = 0;
     VkCommandBuffer cb = why ? VK_NULL_HANDLE : cb_get();
@@ -2505,6 +2510,25 @@ static void cmd_upload(const HleCmdUpload *c)
         if (r->x1 < 0 || r->y1 < 0 || c->x[i] < 0 || c->y[i] < 0 || w <= 0 || h <= 0) {
             continue;
         }
+        /* the rows in guest RAM, or their copy in the arena (from lo) */
+        const uint32_t at = c->pa + (uint32_t)r->y1 * c->pitch + (uint32_t)r->x1 * d->texel_bytes;
+        if (k == 8) {
+            /* At its own size: straight into the surface, no scratch image
+             * or blit (which the format may not have: Sega GT 2002's
+             * R5G6B5 cube faces kept their clear, and its cars reflected
+             * white). */
+            hle_surf_transition(cb, d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkBufferImageCopy dc = {
+                .bufferOffset = c->arena ? (VkDeviceSize)(c->arena - 1) + (at - c->lo) : at,
+                .bufferRowLength = c->pitch / d->texel_bytes,
+                .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 },
+                .imageOffset = { c->x[i], c->y[i], 0 },
+                .imageExtent = { (uint32_t)w, (uint32_t)h, 1 } };
+            T.vkCmdCopyBufferToImage(cb, c->arena ? g_harena.buf : g_hram.buf, o->img,
+                                     d->layout, 1, &dc);
+            n++;
+            continue;
+        }
         VkImage tmp = hle_surf_scratch(d->fmt, (uint32_t)w, (uint32_t)h);
         if (!tmp) {
             why = "no scratch image";
@@ -2512,8 +2536,6 @@ static void cmd_upload(const HleCmdUpload *c)
         }
         hle_img_barrier(cb, tmp, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        /* the rows in guest RAM, or their copy in the arena (from lo) */
-        const uint32_t at = c->pa + (uint32_t)r->y1 * c->pitch + (uint32_t)r->x1 * d->texel_bytes;
         VkBufferImageCopy bc = {
             .bufferOffset = c->arena ? (VkDeviceSize)(c->arena - 1) + (at - c->lo) : at,
             .bufferRowLength = c->pitch / d->texel_bytes,
@@ -2529,13 +2551,13 @@ static void cmd_upload(const HleCmdUpload *c)
             .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
             .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .srcOffsets = { { 0, 0, 0 }, { w, h, 1 } },
-            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 },
             .dstOffsets = { { c->x[i] * k / 8, c->y[i] * k / 8, 0 },
                             { (c->x[i] + w) * k / 8, (c->y[i] + h) * k / 8, 1 } } };
         VkBlitImageInfo2 bi = {
             .sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
             .srcImage = tmp, .srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            .dstImage = d->img, .dstImageLayout = d->layout,
+            .dstImage = o->img, .dstImageLayout = d->layout,
             .regionCount = 1, .pRegions = &br, .filter = VK_FILTER_NEAREST };
         T.vkCmdBlitImage2(cb, &bi);
         n++;
