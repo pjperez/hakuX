@@ -1239,14 +1239,16 @@ static uint32_t scout_take(void *opaque, unsigned subch, uint32_t m, bool noninc
 
 /* Whether scout_take has a use for the n words from method m on subch: a
  * NOP among them (a trap), the 2D objects' (a blit), the 3D object's
- * GET_REPORT or FLIP_INCREMENT_WRITE. */
-static bool scout_wants(unsigned subch, uint32_t m, bool noninc, uint32_t n)
+ * GET_REPORT or FLIP_INCREMENT_WRITE. cls: the subchannels' classes, the
+ * decoder's as the run began (read for each packet, they missed in the
+ * cache the decoder writes: the run's slowest load in a race). */
+static bool scout_wants(const uint8_t *cls8, unsigned subch, uint32_t m, bool noninc, uint32_t n)
 {
 #define SC_HAS(x) (noninc ? m == (x) : m <= (x) && (x) < m + 4 * n)
     if (SC_HAS(NV_NO_OPERATION)) {
         return true;
     }
-    const uint8_t cls = g_pb.obj_class[subch & 7];
+    const uint8_t cls = cls8[subch & 7];
     return cls == NV_CLASS_SURFACES2D || cls == NV_CLASS_BLIT ||
            (cls == 0x97 && (SC_HAS(NV097_GET_REPORT) || SC_HAS(NV097_FLIP_INCREMENT_WRITE)));
 #undef SC_HAS
@@ -1275,6 +1277,8 @@ static int scout_run(uint32_t put)
     }
     unsigned branches = 0;
     const uint64_t words0 = p->words;
+    uint8_t cls[8];
+    memcpy(cls, g_pb.obj_class, sizeof(cls));
     while (p->get != put) {
         if (p->budget && p->words - words0 > p->budget) {
             return scout_fail(HLE_PB_ERR_LOOP, 0);
@@ -1290,7 +1294,7 @@ static int scout_run(uint32_t put)
             if (!n) {
                 return scout_fail(HLE_PB_ERR_LIMIT, 0);
             }
-            if (scout_wants(p->subch, p->method, p->noninc, n)) {
+            if (scout_wants(cls, p->subch, p->method, p->noninc, n)) {
                 n = MIN(n, 1024u);
                 const uint32_t *w = (const uint32_t *)hle_pa_ptr(p->dma_base + p->get, 4 * n);
                 if (!w) {
