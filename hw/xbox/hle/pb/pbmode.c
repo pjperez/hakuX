@@ -1498,6 +1498,7 @@ void hle_pb_state_set(const HlePbState *s)
 static void *decode_thread(void *opaque)
 {
     hle_hitch_thread(HLE_HT_DECODE);    /* the stutter / hang monitor's (hitch.h) */
+    hle_thread_role(HLE_PIN_DECODE);
     t_decoder = true;
     while (!g_pb.stop) {
         /* asleep until a kick: waiting for the guest, the flip it stalls on
@@ -1541,6 +1542,11 @@ void hle_pb_kick(void)
 
 void hle_pb_put(void)
 {
+    static __thread bool t_placed;     /* the vCPU thread: its cores (util/thread.h) */
+    if (!t_placed) {
+        t_placed = true;
+        hle_thread_role(HLE_PIN_VCPU);
+    }
     if (t_hitch < 0 && g_hitch_on) {
         hle_hitch_thread(HLE_HT_VCPU);  /* the vCPU's CPU time for the monitor */
     }

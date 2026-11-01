@@ -497,15 +497,28 @@ static void push_block(VkCommandBuffer cb, const HleFfPush *pc)
                               1, &off);
 }
 
+/* By 64-bit words (the key is views, layouts and samplers, 8-byte
+ * aligned): byte by byte it was a tenth of the render thread on the
+ * Mali-G52's Cortex-A75 at ~1900 draws a frame. */
 static guint fx_hash(gconstpointer k)
 {
-    const uint8_t *b = k;
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < sizeof(FixedKey); i++) {
-        h = (h ^ b[i]) * 16777619u;
+    const uint64_t *w = k;
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (size_t i = 0; i < sizeof(FixedKey) / 8; i++) {
+        h = (h ^ w[i]) * 0xFF51AFD7ED558CCDull;
+        h ^= h >> 32;
     }
-    return h;
+    return (guint)h;
 }
+_Static_assert(sizeof(FixedKey) % 8 == 0, "FixedKey hashed by 64-bit words");
+
+/* The last key's set (fixed_set): runs of draws keep their textures.
+ * Cleared with the command buffer's sets (hle_draw_slot). */
+static struct {
+    bool valid;
+    FixedKey k;
+    VkDescriptorSet set;
+} g_fx_last;
 
 static gboolean fx_equal(gconstpointer a, gconstpointer b)
 {
@@ -539,7 +552,23 @@ static bool fixed_init(void)
 }
 
 /* k's set in the current command buffer's pools, made the first time */
+static VkDescriptorSet fixed_set_new(const FixedKey *k);
+
 static VkDescriptorSet fixed_set(const FixedKey *k)
+{
+    if (g_fx_last.valid && !memcmp(&g_fx_last.k, k, sizeof(*k))) {
+        return g_fx_last.set;
+    }
+    VkDescriptorSet set = fixed_set_new(k);
+    if (set) {
+        g_fx_last.valid = true;
+        g_fx_last.k = *k;
+        g_fx_last.set = set;
+    }
+    return set;
+}
+
+static VkDescriptorSet fixed_set_new(const FixedKey *k)
 {
     __typeof__(g_dr.fx[0]) *f = &g_dr.fx[g_dr.fxslot];
     VkDescriptorSet set = (VkDescriptorSet)g_hash_table_lookup(f->sets, k);
@@ -619,6 +648,7 @@ void hle_draw_slot(unsigned slot)
     if (!g_hvk.caps.bindless && g_dr.mirror) {  /* its previous recording has completed */
         __typeof__(g_dr.fx[0]) *f = &g_dr.fx[g_dr.fxslot = slot % HLE_FRAMES];
         g_hash_table_remove_all(f->sets);
+        g_fx_last.valid = false;
         for (unsigned i = 0; i < f->npool; i++) {
             T.vkResetDescriptorPool(g_hvk.dev, f->pool[i], 0);
         }

@@ -2065,6 +2065,7 @@ static void back_props_poll(uint64_t swap)
         hle_log("hakuX-hle-back", "redefined textures: %s", g_hle_texnew ? "new images" :
                 "the same image while the size and format stay");
     }
+    hle_thread_pin_poll();              /* debug.hakux.pin: which threads get the fast cores */
     v[0] = 0;
     hle_prop_get("debug.hakux.texhoist", v);
     if (!strcmp(v, "0") != g_tex_hoist_off) {
@@ -2717,6 +2718,7 @@ static void *render_thread(void *opaque)
 {
     HleRing *r = hle_fe_ring();
     hle_hitch_thread(HLE_HT_RENDER);
+    hle_thread_role(HLE_PIN_RENDER);
     for (;;) {
         hle_event_reset(&g_back.kick);
         const HleCmdHdr *h;
