@@ -208,6 +208,7 @@ static struct {
     uint64_t batchable, batch_consts, batch_vb;
     uint64_t nomerge[5];                /* why not: strip/fan, indexed, state, other work, vertex gap */
     uint64_t drops[6];                  /* draws dropped, by DROP_* reason */
+    uint64_t whites[6];                 /* stages sampled white, by WHITE_* reason */
     /* asynchronous builds (pipeasync.h): queued to the workers, built by them,
      * built in place (every build with async off; else for a target not
      * redrawn), made from the caches at once; prebuilt pipelines made and
@@ -2493,6 +2494,30 @@ static uint32_t sscl_code(uint32_t e8, unsigned st)
     return code << (24u + 2u * st);
 }
 
+/* Why a stage with a texture sampled the white one (stage_slot); "self":
+ * the target the draw renders, which fbfetch may read instead */
+enum { WHITE_UNKNOWN, WHITE_VIEW, WHITE_NOIMG, WHITE_SELF, WHITE_LAYOUT, WHITE_SLOTS, WHITE_N };
+static const char *const k_white_names[WHITE_N] = { "unknown", "view", "noimg", "self",
+                                                    "layout", "slots" };
+
+static void white_count(uint32_t id, uint32_t rt_id)
+{
+    HleVkSurf *s = hle_surf_get(id);
+    const unsigned why = !s ? WHITE_UNKNOWN : s->d.parent ? WHITE_VIEW : !s->img ? WHITE_NOIMG :
+                         id == rt_id && !s->general ? WHITE_SELF :
+                         !s->general && s->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ?
+                         WHITE_LAYOUT : WHITE_SLOTS;
+    g_dr.whites[why]++;
+    static uint32_t s_told[WHITE_N];
+    if (s_told[why] < 6) {
+        s_told[why]++;
+        hle_log("hakuX-hle-drawlog", "white: tex %u (%s) rt %u: %ux%u xfmt 0x%x parent %u level "
+                "%u face %u layout %d", id, k_white_names[why], rt_id, s ? s->d.w : 0,
+                s ? s->d.h : 0, s ? s->d.xfmt : 0, s ? s->d.parent : 0, s ? s->d.level : 0,
+                s ? s->d.face : 0, s ? (int)s->layout : -1);
+    }
+}
+
 static uint32_t stage_slot(const HleCmdDraw *c, unsigned st, uint32_t rt_id, uint32_t *flags,
                            uint32_t *scl)
 {
@@ -2518,6 +2543,9 @@ static uint32_t stage_slot(const HleCmdDraw *c, unsigned st, uint32_t rt_id, uin
         *scl |= sscl_code(ts->scale, st);
     }
     uint32_t id = c->tex[st];
+    if (id && !slot) {
+        white_count(id, rt_id);
+    }
     if (id && !tx && id < 8192 && g_rt_told < 64 && !(g_rt_seen[id >> 3] >> (id & 7) & 1)) {
         g_rt_seen[id >> 3] |= 1u << (id & 7);
         g_rt_told++;
@@ -4440,7 +4468,7 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
 void hle_draw_ff_diag(void)
 {
     static uint64_t prev[EM_N], prev_draws, prev_merge, prev_no[5], prev_verts;
-    char line[512];
+    char line[768];
     int n = snprintf(line, sizeof(line), "per s: draws=%llu verts=%llu mergeable=%llu (not: strip "
                      "%llu idx %llu state %llu work %llu gap %llu)",
                      (unsigned long long)(g_dr.draws - prev_draws),
@@ -4478,6 +4506,14 @@ void hle_draw_ff_diag(void)
         n += snprintf(line + n, sizeof(line) - (size_t)n, " %s=%llu", k_em_names[i],
                       (unsigned long long)(g_dr.emits[i] - prev[i]));
         prev[i] = g_dr.emits[i];
+    }
+    {
+        static uint64_t pw[WHITE_N];
+        for (unsigned i = 0; i < WHITE_N && n > 0 && (size_t)n < sizeof(line); i++) {
+            n += snprintf(line + n, sizeof(line) - (size_t)n, "%s%s=%llu", i ? " " : " white: ",
+                          k_white_names[i], (unsigned long long)(g_dr.whites[i] - pw[i]));
+            pw[i] = g_dr.whites[i];
+        }
     }
     prev_draws = g_dr.draws;
     prev_verts = g_dr.verts;
