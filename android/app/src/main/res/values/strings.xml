@@ -96,6 +96,27 @@
   <string name="game_settings_use_global">Use the app setting (%1$s)</string>
   <string name="game_settings_this_game">%1$s, for this game</string>
   <string name="game_settings_on">On</string>
+  <string name="game_settings_default">Default: %1$s</string>
+  <string name="game_settings_use_default">Use the default (%1$s)</string>
+  <string name="game_section_performance">Performance</string>
+  <string name="game_threads">CPU cores</string>
+  <string name="game_threads_desc">Which of the phone\'s cores the emulated CPU, the renderer, the GPU command decoder and audio run on. Try another layout if the game stutters.</string>
+  <string name="game_threads_0">Any core (the system picks)</string>
+  <string name="game_threads_1">Renderer and decoder on fast cores, audio on slow ones</string>
+  <string name="game_threads_2">Emulated CPU and renderer on fast cores</string>
+  <string name="game_threads_3">Emulated CPU and decoder on fast cores</string>
+  <string name="game_vis_wait">Visibility tests</string>
+  <string name="game_vis_wait_desc">How long the game waits for the GPU\'s visibility tests (sun glare, lens flares, what\'s hidden). The last result at once is fastest; waiting gives fresher results but can stall the game.</string>
+  <string name="game_vis_wait_0">Last result, no wait</string>
+  <string name="game_vis_wait_ms">Wait up to %1$s ms for a fresh result</string>
+  <string name="game_submit">GPU submits</string>
+  <string name="game_submit_desc">How often draws go to the GPU within a frame. More often starts the GPU sooner; less often splits fewer render passes.</string>
+  <string name="game_submit_ms">Every %1$s ms</string>
+  <string name="game_submit_frame">Once a frame</string>
+  <string name="game_tex_new">New image per texture change</string>
+  <string name="game_tex_new_desc">When the game changes a texture, it gets a new image so the GPU never waits for draws still reading the old one. Uses a little more memory.</string>
+  <string name="game_merge">Merge draws</string>
+  <string name="game_merge_desc">Combines similar draws into one GPU job. Can help GPU-bound games with many small draws, but costs CPU time (slower in Sega GT 2002).</string>
   <string name="game_settings_off">Off</string>
 
   <string name="common_back">Back</string>

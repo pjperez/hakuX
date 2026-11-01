@@ -52,6 +52,16 @@ bool nc_option(NcOptions *o, const char *arg)
         o->async_pipe = atoi(v) != 0;
     } else if ((v = value(arg, "prebuild="))) {
         o->prebuild = atoi(v) != 0;
+    } else if ((v = value(arg, "threads="))) {
+        setenv("HAKUX_HLE_PIN", v, 1);          /* which cores (hle/util/thread.c) */
+    } else if ((v = value(arg, "viswait="))) {
+        setenv("HAKUX_HLE_VIS_WAIT", v, 1);     /* the report gate (hle/mem/barrier.c) */
+    } else if ((v = value(arg, "submitms="))) {
+        setenv("HAKUX_HLE_PB_KICK_MS", v, 1);   /* periodic submits (hle/pb/pbdraw.c) */
+    } else if ((v = value(arg, "texnew="))) {
+        setenv("HAKUX_HLE_TEXNEW", v, 1);       /* redefined textures (hle/vk/draw.c) */
+    } else if ((v = value(arg, "merge="))) {
+        setenv("HAKUX_HLE_MERGE", v, 1);        /* draw merging (hle/vk/batch.c) */
     } else if ((v = value(arg, "devtime="))) {
         nc_io_set_device_time(atoi(v) != 0);    /* console timing (native/kernel/io.c) */
     } else if ((v = value(arg, "pads="))) {

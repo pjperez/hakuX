@@ -2154,6 +2154,10 @@ static void back_props_poll(uint64_t swap)
     }
     v[0] = 0;
     hle_prop_get("debug.hakux.texnew", v);
+    if (!v[0]) {                        /* the game's setting (HAKUX_HLE_TEXNEW, texnew=) */
+        const char *e = getenv("HAKUX_HLE_TEXNEW");
+        snprintf(v, sizeof(v), "%s", e && e[0] ? e : "1");
+    }
     if ((strcmp(v, "0") != 0) != g_hle_texnew) {
         g_hle_texnew = !g_hle_texnew;
         hle_log("hakuX-hle-back", "redefined textures: %s", g_hle_texnew ? "new images" :

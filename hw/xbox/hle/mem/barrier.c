@@ -628,15 +628,17 @@ void hle_barrier_guard_stats(uint64_t *neighbours, uint64_t *hot)
  * 60; ~0.7 s a second waited). */
 #define RPT_PAGES   8
 #define RPT_PENDING 256
-/* How long a read waits for reports none of whose tests has a result yet:
- * then they are given up. Reports whose tests all have one are settled with
- * it at once (rpt_settle), as Dolphin and PCSX2 serve late occlusion
- * results. The gate waited 30 ms for every read and settled nothing: in
- * Sega GT 2002's races ~1 read in 12 waited it out (a dropped frame each)
- * and 9 in 10 found the decoder held short of them; ~8% of the guest's
- * thread waited, for reads that got no result. Waiting up to 6 ms and then
- * settling, ~13% waited (the title read 2.5x as often); settled at once,
- * ~0%. debug.hakux.rptwait=<ms>: live, the wait for the rest. */
+/* The game's setting (HAKUX_HLE_VIS_WAIT, the app's viswait=, ms): 0, a read
+ * whose late reports all have a result from their test's last run gets it at
+ * once (rpt_settle), as Dolphin and PCSX2 serve late occlusion results, and
+ * one with a report that has none waits up to RPT_WAIT_MS; n, every read
+ * waits up to n ms for fresh results, then gets the last ones. The gate once
+ * waited 30 ms and settled nothing: in Sega GT 2002's races ~1 read in 12
+ * waited it out (a dropped frame each) and 9 in 10 found the decoder held
+ * short of them; ~8% of the guest's thread waited, for reads that got no
+ * result. Waiting up to 6 ms and then settling, ~13% waited (the title read
+ * 2.5x as often); settled at once, ~0%. debug.hakux.rptwait=<ms>: live, over
+ * the setting. */
 #define RPT_WAIT_MS 6
 #define RPT_LAST    64
 static struct {
@@ -822,14 +824,19 @@ static void rpt_settle(unsigned pg, uint32_t frame)
 
 static int64_t rpt_wait_ns(void)
 {
-    static int64_t ns = RPT_WAIT_MS * 1000000ll, polled;
+    static int64_t ns = -1, polled;
+    if (ns < 0) {
+        const char *e = getenv("HAKUX_HLE_VIS_WAIT");
+        ns = (e ? atoi(e) : 0) * 1000000ll;
+    }
 #ifdef __ANDROID__
     const int64_t now = hle_now_ns();
     if (now - polled >= 1000000000) {
         polled = now;
         char v[PROP_VALUE_MAX];
         hle_prop_get("debug.hakux.rptwait", v);
-        ns = (v[0] ? atoi(v) : RPT_WAIT_MS) * 1000000ll;
+        const char *e = getenv("HAKUX_HLE_VIS_WAIT");
+        ns = (v[0] ? atoi(v) : e ? atoi(e) : 0) * 1000000ll;
     }
 #else
     (void)polled;
@@ -882,14 +889,17 @@ static bool rpt_access(uint32_t pa)
          * a test soon after it (pbdraw.c) */
         __atomic_store_n(&g_rpt_waiting, 1, __ATOMIC_RELEASE);
         bool (*held)(void) = __atomic_load_n(&g_rpt_held, __ATOMIC_ACQUIRE);
+        /* 0: the last results at once, else fresh ones within wait_ns */
         const int64_t wait_ns = rpt_wait_ns();
+        const bool fresh = wait_ns > 0;
+        const int64_t limit = fresh ? wait_ns : RPT_WAIT_MS * 1000000ll;
         for (;;) {
             rpt_lock();
             late = rpt_late((unsigned)pg, frame, &ahead);
             /* the decoder short of a report and waiting on this thread */
             const bool stuck = late && ahead && held && held();
-            const bool now = late && rpt_settleable((unsigned)pg, frame);
-            if (late && (stuck || now || hle_now_ns() - t0 > wait_ns)) {
+            const bool now = late && !fresh && rpt_settleable((unsigned)pg, frame);
+            if (late && (stuck || now || hle_now_ns() - t0 > limit)) {
                 /* the back end won't write them now (stuck), in time, or at
                  * all (a test the decoder dropped): settled */
                 rpt_settle((unsigned)pg, frame);
@@ -899,7 +909,7 @@ static bool rpt_access(uint32_t pa)
                     /* settled: not a wait given up */
                 } else if (g_rpt.timeouts++ < 8) {
                     hle_log("hakuX-hle-pb", "report gate: page %08x's reports not written in %lld ms",
-                            g_rpt.page[pg] << 12, (long long)(wait_ns / 1000000));
+                            g_rpt.page[pg] << 12, (long long)(limit / 1000000));
                 }
                 late = false;
             }

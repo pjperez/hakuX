@@ -23,6 +23,48 @@ enum class GameSetting(val key: String) {
   VIDEO_1080I("1080i"),
   PAL60("pal60"),
   AV_PACK("av_pack"),
+  // Performance: a game's own (its profile's, else the built-in default), no app setting
+  THREADS("threads"),
+  VIS_WAIT("vis_wait"),
+  SUBMIT_MS("submit_ms"),
+  TEX_NEW("tex_new"),
+  MERGE_DRAWS("merge_draws"),
+}
+
+/**
+ * The performance settings' values for a game before it overrides them: its
+ * profile's (the repository's profiles/<TITLE ID>.txt, packed as the APK's
+ * assets/profiles: "setting=value" lines, # comments), else the built-in
+ * default. A profile is a title's, whatever the disc's version.
+ */
+object GameProfile {
+  /** The built-in defaults (what Sega GT 2002 was tuned with on a Mali-G52). */
+  val BUILTIN = mapOf(
+    GameSetting.THREADS to "1",
+    GameSetting.VIS_WAIT to "0",
+    GameSetting.SUBMIT_MS to "4",
+    GameSetting.TEX_NEW to "true",
+    GameSetting.MERGE_DRAWS to "false",
+  )
+
+  private const val ROOT = "profiles"
+
+  /** The profile of the game with this key (GameOverrides.gameKey): setting -> value. */
+  fun load(context: Context, gameKey: String): Map<GameSetting, String> {
+    val title = gameKey.substringBefore('.').uppercase(Locale.ROOT)
+    val text = runCatching {
+      context.assets.open("$ROOT/$title.txt").bufferedReader().use { it.readText() }
+    }.getOrNull() ?: return emptyMap()
+    return text.lines().mapNotNull { line ->
+      val l = line.substringBefore('#').trim()
+      val k = l.substringBefore('=', "").trim()
+      val v = l.substringAfter('=', "").trim()
+      GameSetting.entries.firstOrNull { it.key == k && it in BUILTIN }?.takeIf { v.isNotEmpty() }?.let { it to v }
+    }.toMap()
+  }
+
+  /** The game's value before its own override: its profile's, else the built-in one. */
+  fun default(profile: Map<GameSetting, String>, s: GameSetting): String = profile[s] ?: BUILTIN.getValue(s)
 }
 
 /**
@@ -81,7 +123,11 @@ class GameOverrides(context: Context, val game: String) {
 }
 
 /** What a run uses: the app's settings with the game's overrides on top. */
-class RunSettings(private val app: AppPrefs, private val game: GameOverrides?) {
+class RunSettings(
+  private val app: AppPrefs,
+  private val game: GameOverrides?,
+  private val profile: Map<GameSetting, String> = emptyMap(),
+) {
   private fun bool(s: GameSetting, global: Boolean) = game?.get(s)?.toBooleanStrictOrNull() ?: global
   private fun text(s: GameSetting, global: String) = game?.get(s) ?: global
 
@@ -102,6 +148,14 @@ class RunSettings(private val app: AppPrefs, private val game: GameOverrides?) {
   val video1080i get() = bool(GameSetting.VIDEO_1080I, app.video1080i)
   val pal60 get() = bool(GameSetting.PAL60, app.pal60)
   val avPack get() = text(GameSetting.AV_PACK, app.avPack)
+
+  /** The performance settings: the game's override, its profile's, the built-in default. */
+  private fun perf(s: GameSetting) = game?.get(s) ?: GameProfile.default(profile, s)
+  val threads get() = perf(GameSetting.THREADS)
+  val visWait get() = perf(GameSetting.VIS_WAIT)
+  val submitMs get() = perf(GameSetting.SUBMIT_MS)
+  val texNew get() = perf(GameSetting.TEX_NEW).toBooleanStrictOrNull() ?: true
+  val mergeDraws get() = perf(GameSetting.MERGE_DRAWS).toBooleanStrictOrNull() ?: false
 
   fun videoFlags(): Int = AppPrefs.videoFlags(screenFormat, video480p, video720p, video1080i, pal60)
   fun xboxLanguage(): Int = AppPrefs.xboxLanguage(language)

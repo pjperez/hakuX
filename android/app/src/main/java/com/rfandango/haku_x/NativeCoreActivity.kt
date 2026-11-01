@@ -35,6 +35,7 @@ import com.rfandango.haku_x.data.AppPrefs
 import com.rfandango.haku_x.data.CheatInfo
 import com.rfandango.haku_x.data.Controllers
 import com.rfandango.haku_x.data.GameOverrides
+import com.rfandango.haku_x.data.GameProfile
 import com.rfandango.haku_x.data.Logs
 import com.rfandango.haku_x.data.ModCatalog
 import com.rfandango.haku_x.data.ModChoices
@@ -233,7 +234,8 @@ class NativeCoreActivity : SDLActivity(), InputManager.InputDeviceListener {
       args += "version=$it"
     }
     /* The app's settings, under this game's overrides. */
-    val settings = RunSettings(AppPrefs(this), gameOverrides())
+    val settings = RunSettings(AppPrefs(this), gameOverrides(),
+                               if (discUri != null) GameProfile.load(this, gameKey()) else emptyMap())
     /* Every frame presented at once, no vblank wait: on by default. */
     if (settings.uncapped) {
       args += "uncap"
@@ -266,6 +268,15 @@ class NativeCoreActivity : SDLActivity(), InputManager.InputDeviceListener {
     /* Reads take a quarter of the console's drives' time, their thread
      * waiting (the game's other threads run meanwhile, as on the console). */
     args += "devtime=${if (settings.consoleTiming) 1 else 0}"
+    /* Performance (the game's settings, else its profile's): which cores the
+     * emulator's threads run on, how long a read of a visibility test waits
+     * for its result, how often draws go to the GPU, a texture's new image at
+     * each redefinition, and draws merged into one GPU job. */
+    args += "threads=${settings.threads}"
+    args += "viswait=${settings.visWait}"
+    args += "submitms=${settings.submitMs}"
+    args += "texnew=${if (settings.texNew) 1 else 0}"
+    args += "merge=${if (settings.mergeDraws) 1 else 0}"
     /* The console's network (native/net): system link with the consoles on
      * this network (their broadcasts reach it under the multicast lock), or
      * through an XLink Kai engine; the Internet through NAT, Insignia's DNS

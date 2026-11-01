@@ -109,6 +109,8 @@ android {
 
   // The repository's mods/ folder as assets/mods (syncModAssets below).
   sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("generated/modAssets").get().asFile)
+  // The repository's profiles/ folder as assets/profiles (syncProfileAssets below).
+  sourceSets.getByName("main").assets.srcDir(layout.buildDirectory.dir("generated/profileAssets").get().asFile)
 }
 
 // The repository's mods/ folder (mods and cheats per game: mods/README.md),
@@ -118,7 +120,13 @@ val syncModAssets = tasks.register<Sync>("syncModAssets") {
   from(rootProject.file("../mods")) { exclude("README.md") }
   into(layout.buildDirectory.dir("generated/modAssets/mods"))
 }
-tasks.named("preBuild") { dependsOn(syncModAssets) }
+// The repository's profiles/ folder (each game's performance defaults:
+// profiles/README.md) as the APK's assets/profiles; its README stays out.
+val syncProfileAssets = tasks.register<Sync>("syncProfileAssets") {
+  from(rootProject.file("../profiles")) { exclude("README.md") }
+  into(layout.buildDirectory.dir("generated/profileAssets/profiles"))
+}
+tasks.named("preBuild") { dependsOn(syncModAssets, syncProfileAssets) }
 
 dependencies {
   implementation("androidx.core:core-ktx:1.15.0")

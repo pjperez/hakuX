@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #ifdef __ANDROID__
@@ -276,6 +277,8 @@ static void pin_probe(void)
     g_pin.mixed = best && g_pin.nfast < n;
 }
 
+/* The game's setting (HAKUX_HLE_PIN, the app's threads=), else 1; debug:
+ * debug.hakux.pin over it, live */
 static int pin_mode(void)
 {
 #ifdef __ANDROID__
@@ -284,7 +287,8 @@ static int pin_mode(void)
         return v[0] - '0';
     }
 #endif
-    return 1;
+    const char *e = getenv("HAKUX_HLE_PIN");
+    return e && e[0] >= '0' && e[0] <= '3' && !e[1] ? e[0] - '0' : 1;
 }
 
 /* Role r's cores in mode m. */

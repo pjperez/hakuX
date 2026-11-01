@@ -23,20 +23,49 @@ import com.rfandango.haku_x.BuildConfig
 import com.rfandango.haku_x.R
 import com.rfandango.haku_x.data.AppPrefs
 import com.rfandango.haku_x.data.GameOverrides
+import com.rfandango.haku_x.data.GameProfile
 import com.rfandango.haku_x.data.GameSetting
 import com.rfandango.haku_x.ui.common.ChoiceDialog
 import com.rfandango.haku_x.ui.common.Hint
 import com.rfandango.haku_x.ui.common.Section
 import com.rfandango.haku_x.ui.common.SubScreen
 
-/** A setting a game can override: its values (as stored) and how they read. */
+/**
+ * A setting a game can override: its values (as stored) and how they read.
+ * A performance setting has no app setting (perf): its default is the game's
+ * profile's or the built-in one, and it says what it does (desc).
+ */
 private class Overridable(
   val setting: GameSetting,
   val title: Int,
   val values: List<String>,
   val global: (AppPrefs) -> String,
   val label: @Composable (String) -> String,
+  val desc: Int? = null,
+  val perf: Boolean = false,
 )
+
+@Composable
+private fun threadsLabel(v: String) = stringResource(
+  when (v) {
+    "0" -> R.string.game_threads_0
+    "2" -> R.string.game_threads_2
+    "3" -> R.string.game_threads_3
+    else -> R.string.game_threads_1
+  },
+)
+
+@Composable
+private fun visWaitLabel(v: String) =
+  if (v == "0") stringResource(R.string.game_vis_wait_0) else stringResource(R.string.game_vis_wait_ms, v)
+
+@Composable
+private fun submitLabel(v: String) =
+  if (v == "0") stringResource(R.string.game_submit_frame) else stringResource(R.string.game_submit_ms, v)
+
+private fun perf(s: GameSetting, title: Int, values: List<String>, desc: Int,
+                 label: @Composable (String) -> String) =
+  Overridable(s, title, values, { "" }, label, desc, perf = true)
 
 private val ON_OFF = listOf("true", "false")
 
@@ -71,6 +100,13 @@ private val SECTIONS: List<Pair<Int, List<Overridable>>> = listOf(
     Overridable(GameSetting.PAL60, R.string.settings_pal60, ON_OFF, { it.pal60.toString() }, { onOff(it) }),
     Overridable(GameSetting.AV_PACK, R.string.settings_av_cable, CABLES, { it.avPack }, { stringResource(cableLabel(it)) }),
   ),
+  R.string.game_section_performance to listOf(
+    perf(GameSetting.THREADS, R.string.game_threads, listOf("1", "0", "2", "3"), R.string.game_threads_desc) { threadsLabel(it) },
+    perf(GameSetting.VIS_WAIT, R.string.game_vis_wait, listOf("0", "6", "30"), R.string.game_vis_wait_desc) { visWaitLabel(it) },
+    perf(GameSetting.SUBMIT_MS, R.string.game_submit, listOf("2", "4", "8", "0"), R.string.game_submit_desc) { submitLabel(it) },
+    perf(GameSetting.TEX_NEW, R.string.game_tex_new, ON_OFF, R.string.game_tex_new_desc) { onOff(it) },
+    perf(GameSetting.MERGE_DRAWS, R.string.game_merge, ON_OFF, R.string.game_merge_desc) { onOff(it) },
+  ),
 )
 
 /** One game's settings: each follows the app's until the game overrides it. */
@@ -79,6 +115,12 @@ fun GameSettingsScreen(gameKey: String, title: String, onBack: () -> Unit) {
   val context = LocalContext.current
   val prefs = remember { AppPrefs(context) }
   val overrides = remember(gameKey) { GameOverrides(context, gameKey) }
+  val profile = remember(gameKey) { GameProfile.load(context, gameKey) }
+  /* what a setting follows until the game overrides it: the app's, or a
+   * performance setting's default */
+  @Composable
+  fun followed(item: Overridable) =
+    item.label(if (item.perf) GameProfile.default(profile, item.setting) else item.global(prefs))
   val values = remember(gameKey) {
     mutableStateMapOf<GameSetting, String?>().apply { GameSetting.entries.forEach { put(it, overrides[it]) } }
   }
@@ -112,8 +154,13 @@ fun GameSettingsScreen(gameKey: String, title: String, onBack: () -> Unit) {
                   stringResource(R.string.game_settings_this_game, item.label(own)),
                   color = MaterialTheme.colorScheme.primary,
                 )
+              } else if (item.perf) {
+                Text(stringResource(R.string.game_settings_default, followed(item)))
               } else {
-                Text(stringResource(R.string.game_settings_global, item.label(item.global(prefs))))
+                Text(stringResource(R.string.game_settings_global, followed(item)))
+              }
+              item.desc?.let {
+                Text(stringResource(it), style = MaterialTheme.typography.bodySmall)
               }
             },
             modifier = Modifier.clickable { editing = item },
@@ -124,7 +171,8 @@ fun GameSettingsScreen(gameKey: String, title: String, onBack: () -> Unit) {
   }
 
   editing?.let { item ->
-    val useGlobal = stringResource(R.string.game_settings_use_global, item.label(item.global(prefs)))
+    val useGlobal = stringResource(
+      if (item.perf) R.string.game_settings_use_default else R.string.game_settings_use_global, followed(item))
     ChoiceDialog(
       title = stringResource(item.title),
       options = listOf<String?>(null).map { it to useGlobal } + item.values.map { it to item.label(it) },

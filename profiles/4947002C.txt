@@ -1,0 +1,10 @@
+# Sega GT 2002, tuned on the Anbernic RG Vita (Mali-G52, T618) at 1x:
+# the renderer and decoder on the fast cores with the emulated CPU free (it
+# kept off them: 33 fps against 43), visibility tests answered with their last
+# result (waiting cost ~8-13% of the emulated CPU), merging off (44 fps merged
+# against 50).
+threads=1
+vis_wait=0
+submit_ms=4
+tex_new=true
+merge_draws=false
