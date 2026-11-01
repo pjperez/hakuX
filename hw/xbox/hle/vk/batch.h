@@ -64,7 +64,7 @@ typedef struct HleMergeEnv {
                         uint32_t max);
 } HleMergeEnv;
 
-/* HAKUX_HLE_MERGE=0 / debug.hakux.merge=0: off (read once). */
+/* HAKUX_HLE_MERGE=1 / debug.hakux.merge=1: on (read once; off by default). */
 bool hle_merge_wanted(void);
 /* With the batch's index buffer up (hle_batch_init), from draw.c's init. */
 void hle_merge_init(const HleMergeEnv *env);

@@ -680,8 +680,11 @@ bool hle_merge_wanted(void)
 {
     static int w = -1;
     if (w < 0) {
+        /* off by default: on the Mali-G52 each merged draw's switches to
+         * its pipeline and vertex layout and back cost the driver more than
+         * the jobs it saves (Sega GT 2002's race: 44 fps merged, 50 not) */
         const char *e = getenv("HAKUX_HLE_MERGE");
-        w = e ? atoi(e) != 0 : 1;
+        w = e ? atoi(e) != 0 : 0;
 #ifdef __ANDROID__
         char v[PROP_VALUE_MAX] = "";
         if (!e && hle_prop_get("debug.hakux.merge", v) > 0 && v[0]) {
