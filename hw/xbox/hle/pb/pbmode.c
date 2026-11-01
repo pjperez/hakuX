@@ -97,6 +97,8 @@ static struct {
     uint32_t flip_mark;                 /* ... the trace's position as it began */
     bool dumped;                        /* the trace dumped (once a run) */
     bool trap_wait;                     /* a software trap until the ISR clears it */
+    bool pace_wait;                     /* after a swap, the frame pace (hle_pbd_pace) */
+    uint64_t paces;                     /* ... stalls */
     uint32_t sub_r[8][0x400 / 4];       /* the 2D objects' methods, by subchannel */
     uint32_t s2d[0x400 / 4];            /* the 2D surfaces' (one at a time in D3D) */
     uint64_t blits, blit_bytes, m2mfs, m2mf_bytes, copies_skipped;
@@ -806,6 +808,13 @@ static int count_method(void *opaque, unsigned subch, uint32_t m, uint32_t v)
         int r = kelvin(m, v);
         hle_kelvin_method(m, v);                /* its register shadow: the draw state */
         hle_pbd_method(m, v);
+        if (m == NV097_FLIP_INCREMENT_WRITE && r == HLE_PB_GO && hle_pbd_pace()) {
+            /* the swap is on its way; the decoder stops here as at a
+             * FLIP_STALL until the GPU is close enough behind it */
+            g_pb.pace_wait = true;
+            g_pb.paces++;
+            return HLE_PB_STALL;
+        }
         return r;
     }
     if (m < 0x400) {
@@ -905,6 +914,13 @@ static void consume_pass(void)
         g_pb.flip_wait = false;
         hle_host_gpu_trace(HLE_GTR_RESUME, 2);
     }
+    if (g_pb.pace_wait) {
+        if (!hle_pbd_pace_reached()) {
+            return;                                 /* the GPU's kick comes back */
+        }
+        g_pb.pace_wait = false;
+        hle_host_gpu_trace(HLE_GTR_RESUME, 3);
+    }
     uint32_t base, limit, inst;
     uint32_t put = hle_host_gpu_reg(NV_PFIFO_CACHE1_DMA_PUT);
     if (!dma_object(&base, &limit, &inst)) {
@@ -965,14 +981,14 @@ static void consume_pass(void)
  * guest pushed before it: up to the PUT it wrote, which holds while the
  * guest runs nothing. The decoder waiting on the guest (a trap for its
  * interrupt handler, the FIFO access it turned off, a FLIP_STALL) or for the
- * GPU (arena room), or 50 ms, end the wait. */
+ * GPU (arena room, the frame pace), or 50 ms, end the wait. */
 static struct {
     uint32_t target;                    /* the PUT the decoder must reach */
     int state;                          /* 1 a store waits, 2 released (atomic) */
     HleSem sem;
     uint64_t waits, caught, timeouts, ns;
-    uint64_t gave_up[4];                /* the decoder at a trap, a FLIP_STALL, the FIFO off,
-                                         * waiting for arena room */
+    uint64_t gave_up[5];                /* the decoder at a trap, a FLIP_STALL, the FIFO off,
+                                         * waiting for arena room, the frame pace */
 } g_cu;
 static __thread bool t_decoder;
 
@@ -983,7 +999,7 @@ static void catch_up_check(void)
         return;
     }
     const bool there = g_pb.p.get == g_cu.target;
-    if (!there && !g_pb.trap_wait && !g_pb.flip_wait && fifo_open()) {
+    if (!there && !g_pb.trap_wait && !g_pb.flip_wait && !g_pb.pace_wait && fifo_open()) {
         return;
     }
     int one = 1;
@@ -991,7 +1007,7 @@ static void catch_up_check(void)
         if (there) {
             g_cu.caught++;
         } else {
-            g_cu.gave_up[g_pb.trap_wait ? 0 : g_pb.flip_wait ? 1 : 2]++;
+            g_cu.gave_up[g_pb.trap_wait ? 0 : g_pb.flip_wait ? 1 : g_pb.pace_wait ? 4 : 2]++;
         }
         hle_sem_post(&g_cu.sem);
     }
@@ -1044,9 +1060,10 @@ static void catch_up(void)
                                         __ATOMIC_ACQUIRE) && g_cu.timeouts++ < 16) {
             const char *ph = hle_pbd_phase();
             hle_log("hakuX-hle-pb", "catch-up timed out: decoder GET %08x for PUT %08x (now %08x), "
-                    "%s%s%s%s, phase %s", __atomic_load_n(&g_pb.p.get, __ATOMIC_RELAXED), put,
+                    "%s%s%s%s%s, phase %s", __atomic_load_n(&g_pb.p.get, __ATOMIC_RELAXED), put,
                     hle_host_gpu_reg(NV_PFIFO_CACHE1_DMA_PUT), g_pb.in_run ? "in a run" : "between runs",
                     g_pb.trap_wait ? ", trap" : "", g_pb.flip_wait ? ", flip stall" : "",
+                    g_pb.pace_wait ? ", frame pace" : "",
                     fifo_open() ? "" : ", FIFO off", ph ? ph : "none");
         }
     }
@@ -1081,6 +1098,7 @@ static struct {
     uint32_t blit_in[8], blit_out[8];   /* the blits' POINT_IN / POINT_OUT, by subchannel */
     struct { uint32_t pa, v; } patch[SC_PATCHES];   /* words the blits read will write */
     unsigned npatch;
+    unsigned live;                      /* of them not yet read (pa != 0) */
 } g_sc;
 
 static void scout_report(uint32_t v)
@@ -1113,6 +1131,7 @@ static void scout_blit(unsigned subch, uint32_t size)
     const uint32_t *src = (const uint32_t *)hle_pa_ptr(so, 4 * w);
     for (uint32_t i = 0; src && i < w; i++) {
         unsigned k = g_sc.npatch++ % SC_PATCHES;
+        g_sc.live += !g_sc.patch[k].pa;
         g_sc.patch[k].pa = d + 4 * i;
         g_sc.patch[k].v = src[i];
     }
@@ -1142,8 +1161,9 @@ static const uint32_t *scout_fetch(void *ctx, uint32_t pa, uint32_t n)
     static uint32_t v;
     for (unsigned i = 0; n == 1 && i < MIN(g_sc.npatch, SC_PATCHES); i++) {
         const unsigned k = (g_sc.npatch - 1 - i) % SC_PATCHES;
-        if (g_sc.patch[k].pa == pa) {
+        if (pa && g_sc.patch[k].pa == pa) {
             g_sc.patch[k].pa = 0;
+            g_sc.live--;
             v = g_sc.patch[k].v;
             return &v;
         }
@@ -1211,20 +1231,150 @@ static uint32_t scout_take(void *opaque, unsigned subch, uint32_t m, bool noninc
     return n;
 }
 
-static int scout_method(void *opaque, unsigned subch, uint32_t m, uint32_t v)
-{
-    int stall = HLE_PB_GO;
-    scout_take(opaque, subch, m, false, &v, 1, &stall);
-    return stall;
-}
-
-static const HlePbSink k_scout = { NULL, scout_method, scout_take, NULL };
-
 /* Words the scout reads at one PUT at most (16 MiB, more than a frame's
  * push buffer): off the stream, it went round old commands forever in the
  * guest's thread (Halo 2's boot: a channel set-up through CACHE1, then a new
  * push buffer; the scout stayed in the old one, which jumps to its start). */
 #define SCOUT_BUDGET (4u << 20)
+
+/* Whether scout_take has a use for the n words from method m on subch: a
+ * NOP among them (a trap), the 2D objects' (a blit), the 3D object's
+ * GET_REPORT or FLIP_INCREMENT_WRITE. cls: the subchannels' classes, the
+ * decoder's as the run began (read for each packet, they missed in the
+ * cache the decoder writes: the run's slowest load in a race). */
+static bool scout_wants(const uint8_t *cls8, unsigned subch, uint32_t m, bool noninc, uint32_t n)
+{
+#define SC_HAS(x) (noninc ? m == (x) : m <= (x) && (x) < m + 4 * n)
+    if (SC_HAS(NV_NO_OPERATION)) {
+        return true;
+    }
+    const uint8_t cls = cls8[subch & 7];
+    return cls == NV_CLASS_SURFACES2D || cls == NV_CLASS_BLIT ||
+           (cls == 0x97 && (SC_HAS(NV097_GET_REPORT) || SC_HAS(NV097_FLIP_INCREMENT_WRITE)));
+#undef SC_HAS
+}
+
+static int scout_fail(int e, uint32_t word)
+{
+    HlePusher *p = &g_sc.p;
+    if (!p->error) {
+        p->error = e;
+        p->error_get = p->get;
+        p->error_word = word;
+    }
+    return e;
+}
+
+/* The pusher's run (pusher.c hle_pb_pusher_run) for the scout: guest RAM
+ * read in place, a packet scout_take has no use for stepped over unread and
+ * without a call. Sega GT 2002 pushes ~1.5 M packets a second: the pusher's
+ * calls for each (fetch, sink) were ~9% of the guest's thread. */
+static int scout_run(uint32_t put)
+{
+    HlePusher *p = &g_sc.p;
+    if (p->error) {
+        return p->error;
+    }
+    unsigned branches = 0;
+    const uint64_t words0 = p->words;
+    uint8_t cls[8];
+    memcpy(cls, g_pb.obj_class, sizeof(cls));
+    while (p->get != put) {
+        if (p->budget && p->words - words0 > p->budget) {
+            return scout_fail(HLE_PB_ERR_LOOP, 0);
+        }
+        const uint32_t room = p->get <= p->dma_limit ? (p->dma_limit - p->get) / 4 + 1 : 0;
+        if (p->left) {
+            branches = 0;
+            uint32_t n = p->left;
+            if (put > p->get) {
+                n = MIN(n, (put - p->get) / 4);
+            }
+            n = MIN(n, room);
+            if (!n) {
+                return scout_fail(HLE_PB_ERR_LIMIT, 0);
+            }
+            if (scout_wants(cls, p->subch, p->method, p->noninc, n)) {
+                n = MIN(n, 1024u);
+                const uint32_t *w = (const uint32_t *)hle_pa_ptr(p->dma_base + p->get, 4 * n);
+                if (!w) {
+                    return scout_fail(HLE_PB_ERR_FETCH, 0);
+                }
+                int stall = HLE_PB_GO;
+                n = MAX(MIN(scout_take(NULL, p->subch, p->method, p->noninc, w, n, &stall), n), 1u);
+                p->get += 4 * n;
+                p->left -= n;
+                p->data += n;
+                p->words += n;
+                if (!p->noninc) {
+                    p->method += 4 * n;
+                }
+                if (stall != HLE_PB_GO) {
+                    return HLE_PB_OK;
+                }
+                continue;
+            }
+            p->get += 4 * n;
+            p->left -= n;
+            p->data += n;
+            p->words += n;
+            if (!p->noninc) {
+                p->method += 4 * n;
+            }
+            continue;
+        }
+        if (!room) {
+            return scout_fail(HLE_PB_ERR_LIMIT, 0);
+        }
+        const uint32_t *wp = g_sc.live ? scout_fetch(NULL, p->dma_base + p->get, 1) :
+                             (const uint32_t *)hle_pa_ptr(p->dma_base + p->get, 4);
+        if (!wp) {
+            return scout_fail(HLE_PB_ERR_FETCH, 0);
+        }
+        const uint32_t w = *wp;
+        if ((w & 0xE0000003u) == 0x20000000u || (w & 3) == 1 || (w & 3) == 2 ||
+            w == 0x00020000u) {
+            if (++branches > 65536u) {
+                return scout_fail(HLE_PB_ERR_LOOP, w);
+            }
+            p->branches++;
+            p->words++;
+            if ((w & 0xE0000003u) == 0x20000000u) {        /* old jump */
+                p->get = w & 0x1FFFFFFCu;
+            } else if ((w & 3) == 1) {                      /* jump */
+                p->get = w & ~3u;
+            } else if ((w & 3) == 2) {                      /* call */
+                if (p->sub_active) {
+                    return scout_fail(HLE_PB_ERR_CALL, w);
+                }
+                p->sub_active = true;
+                p->sub_return = p->get + 4;
+                p->get = w & ~3u;
+            } else {                                        /* return */
+                if (!p->sub_active) {
+                    return scout_fail(HLE_PB_ERR_RETURN, w);
+                }
+                p->sub_active = false;
+                p->get = p->sub_return;
+            }
+            continue;
+        }
+        const uint32_t kind = w & 0xE0030003u;
+        if (kind != 0 && kind != 0x40000000u) {
+            return scout_fail(HLE_PB_ERR_INVALID, w);
+        }
+        branches = 0;
+        p->get += 4;
+        p->words++;
+        p->headers++;
+        p->method = w & 0x1FFCu;
+        p->subch = (uint8_t)((w >> 13) & 7);
+        p->left = (w >> 18) & 0x7FFu;
+        p->count = p->left;
+        p->noninc = kind != 0;
+    }
+    return HLE_PB_OK;
+}
 
 /* Whether the decoder is past the trap the scout waits at: among its traps
  * past since the scout's last find (more than its ring holds: past it). */
@@ -1262,6 +1412,8 @@ static uint32_t scout_to(uint32_t put)
         g_sc.synced = true;
         g_sc.at_trap = false;
         g_sc.npatch = 0;
+        g_sc.live = 0;
+        memset(g_sc.patch, 0, sizeof(g_sc.patch));
         /* the format, pitches and DMA objects come with the device's set-up,
          * long before: the decoder's (its offsets are behind, the scout's
          * own come with each blit) */
@@ -1273,7 +1425,7 @@ static uint32_t scout_to(uint32_t put)
         return g_sc.frame;
     }
     g_sc.at_trap = false;
-    if (hle_pb_pusher_run(&g_sc.p, put, scout_fetch, NULL, &k_scout) == HLE_PB_ERR_LOOP) {
+    if (scout_run(put) == HLE_PB_ERR_LOOP) {
         static unsigned logged;                 /* it syncs again at the next PUT */
         if (logged++ < 8) {
             hle_log("hakuX-hle-pb", "report scout: lost the stream at GET %08x (PUT %08x, %s)",
@@ -1293,7 +1445,7 @@ static uint32_t scout(void)
  * guest itself (the catch-up's reasons to give up) */
 static bool decoder_held(void)
 {
-    return g_pb.trap_wait || g_pb.flip_wait || !fifo_open();
+    return g_pb.trap_wait || g_pb.flip_wait || g_pb.pace_wait || !fifo_open();
 }
 
 void hle_pb_pushed(uint32_t put)
@@ -1463,6 +1615,7 @@ void hle_pb_state_set(const HlePbState *s)
     g_pb.flip_wait = s->flip_wait;
     g_pb.flip_wait_ns = hle_now_ns();
     g_pb.trap_wait = s->trap_wait;
+    g_pb.pace_wait = false;                 /* the loaded GPU has nothing in flight */
     g_trel.pending = false;                 /* the scout syncs again at the next PUT */
     g_sc.synced = false;
     memcpy(g_pb.sub_r, s->sub_r, sizeof(s->sub_r));
@@ -1480,13 +1633,15 @@ void hle_pb_state_set(const HlePbState *s)
 static void *decode_thread(void *opaque)
 {
     hle_hitch_thread(HLE_HT_DECODE);    /* the stutter / hang monitor's (hitch.h) */
+    hle_thread_role(HLE_PIN_DECODE);
     t_decoder = true;
     while (!g_pb.stop) {
         /* asleep until a kick: waiting for the guest, the flip it stalls on
-         * (FLIP_STALL) or its interrupt handler (a trap); once a sleep, not
-         * a method */
+         * (FLIP_STALL), its interrupt handler (a trap) or the GPU (the frame
+         * pace); once a sleep, not a method */
         const uint32_t pa = hle_hitch_enter(g_pb.flip_wait ? HLE_ACT_FLIP :
-                                            g_pb.trap_wait ? HLE_ACT_TRAP : HLE_ACT_IDLE);
+                                            g_pb.trap_wait ? HLE_ACT_TRAP :
+                                            g_pb.pace_wait ? HLE_ACT_GPU : HLE_ACT_IDLE);
         hle_sem_wait(&g_pb.kick);
         hle_hitch_leave(pa);
         while (!g_pb.stop) {
@@ -1522,6 +1677,11 @@ void hle_pb_kick(void)
 
 void hle_pb_put(void)
 {
+    static __thread bool t_placed;     /* the vCPU thread: its cores (util/thread.h) */
+    if (!t_placed) {
+        t_placed = true;
+        hle_thread_role(HLE_PIN_VCPU);
+    }
     if (t_hitch < 0 && g_hitch_on) {
         hle_hitch_thread(HLE_HT_VCPU);  /* the vCPU's CPU time for the monitor */
     }
@@ -1677,6 +1837,7 @@ void hle_pb_diag(void)
     /* where the decoder is: waiting for the ISR (trap), a flip, the FIFO
      * access, arena or ring space in a draw, or decoding */
     const char *ph = hle_pbd_phase(), *state = g_pb.trap_wait ? " (trap)" : g_pb.flip_wait ? " (flip stall)"
+                                              : g_pb.pace_wait    ? " (frame pace)"
                                               : !fifo_open()      ? " (fifo closed)"
                                               : ph && *ph == 'a'  ? " (arena wait)"
                                               : ph                ? " (ring wait)"
@@ -1720,10 +1881,12 @@ void hle_pb_diag(void)
         prev_cu = cu;
         hle_log("hakuX-hle-pb", "catch-up: %llu stores waited for the decoder (caught up %llu; it "
                 "waited on the guest at a trap %llu, a flip stall %llu, the FIFO off %llu; for arena "
-                "room %llu; timed out %llu), %.1f ms", (unsigned long long)cu,
+                "room %llu, the frame pace %llu of its %llu stalls; timed out %llu), %.1f ms",
+                (unsigned long long)cu,
                 (unsigned long long)g_cu.caught, (unsigned long long)g_cu.gave_up[0],
                 (unsigned long long)g_cu.gave_up[1], (unsigned long long)g_cu.gave_up[2],
-                (unsigned long long)g_cu.gave_up[3], (unsigned long long)g_cu.timeouts,
+                (unsigned long long)g_cu.gave_up[3], (unsigned long long)g_cu.gave_up[4],
+                (unsigned long long)g_pb.paces, (unsigned long long)g_cu.timeouts,
                 (double)g_cu.ns / 1e6);
     }
     static uint64_t prev_coh;
@@ -1738,13 +1901,14 @@ void hle_pb_diag(void)
                 (unsigned long long)nbr, (unsigned long long)hot);
     }
     static uint64_t prev_rw;
-    uint64_t rw, rns, rto, rheld;
-    hle_barrier_report_stats(&rw, &rns, &rto, &rheld);
+    uint64_t rw, rns, rto, rheld, rset;
+    hle_barrier_report_stats(&rw, &rns, &rto, &rheld, &rset);
     if (rw != prev_rw) {
         hle_log("hakuX-hle-pb", "report gate: %llu reads waited for their visibility tests (+%llu), "
-                "%.1f ms in all, %llu given up, %llu at once (the decoder held short of them)",
+                "%.1f ms in all, %llu given up, %llu at once (the decoder held short of them), "
+                "%llu reports settled with their last result",
                 (unsigned long long)rw, (unsigned long long)(rw - prev_rw), (double)rns / 1e6,
-                (unsigned long long)rto, (unsigned long long)rheld);
+                (unsigned long long)rto, (unsigned long long)rheld, (unsigned long long)rset);
         prev_rw = rw;
     }
     hle_back_draw_diag();               /* the back end's state recorded per draw (hakuX-hle-emit) */

@@ -123,8 +123,9 @@ typedef struct HlePipe {
 
 /* The state commands a draw may record, counted for the per-second log: what
  * the GPU does between draws. */
-enum { EM_PIPE, EM_SET1, EM_PC, EM_VI, EM_VB, EM_VP, EM_SC, EM_DYN, EM_FB, EM_N };
-static const char *const k_em_names[EM_N] = { "pipe", "set1", "pc", "vi", "vb", "vp", "sc", "dyn", "fb" };
+enum { EM_PIPE, EM_SET1, EM_PC, EM_VI, EM_VB, EM_VP, EM_SC, EM_DYN, EM_FB, EM_SET0, EM_N };
+static const char *const k_em_names[EM_N] = { "pipe", "set1", "pc", "vi", "vb", "vp", "sc", "dyn", "fb",
+                                              "set0" };
 
 /* Without descriptor indexing (caps.bindless off): a slot as the bindless set
  * would hold it (write_slot_layout3): its 2D, cube and 3D views (the white
@@ -201,8 +202,13 @@ static struct {
     uint64_t idx_same, idx_contig;      /* indexed merge potential (hle_draw_ff_diag) */
     uint64_t emits[EM_N];               /* state commands recorded, by EM_* kind */
     uint64_t mergeable;                 /* draws that could have joined the previous one */
+    /* batching potential (counted, not done): a draw whose only change from
+     * the previous one (same pass, topology and indexing) is its vertex
+     * constants (set 1) and/or vertex buffer offsets */
+    uint64_t batchable, batch_consts, batch_vb;
     uint64_t nomerge[5];                /* why not: strip/fan, indexed, state, other work, vertex gap */
     uint64_t drops[6];                  /* draws dropped, by DROP_* reason */
+    uint64_t whites[6];                 /* stages sampled white, by WHITE_* reason */
     /* asynchronous builds (pipeasync.h): queued to the workers, built by them,
      * built in place (every build with async off; else for a target not
      * redrawn), made from the caches at once; prebuilt pipelines made and
@@ -497,15 +503,28 @@ static void push_block(VkCommandBuffer cb, const HleFfPush *pc)
                               1, &off);
 }
 
+/* By 64-bit words (the key is views, layouts and samplers, 8-byte
+ * aligned): byte by byte it was a tenth of the render thread on the
+ * Mali-G52's Cortex-A75 at ~1900 draws a frame. */
 static guint fx_hash(gconstpointer k)
 {
-    const uint8_t *b = k;
-    uint32_t h = 2166136261u;
-    for (size_t i = 0; i < sizeof(FixedKey); i++) {
-        h = (h ^ b[i]) * 16777619u;
+    const uint64_t *w = k;
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (size_t i = 0; i < sizeof(FixedKey) / 8; i++) {
+        h = (h ^ w[i]) * 0xFF51AFD7ED558CCDull;
+        h ^= h >> 32;
     }
-    return h;
+    return (guint)h;
 }
+_Static_assert(sizeof(FixedKey) % 8 == 0, "FixedKey hashed by 64-bit words");
+
+/* The last key's set (fixed_set): runs of draws keep their textures.
+ * Cleared with the command buffer's sets (hle_draw_slot). */
+static struct {
+    bool valid;
+    FixedKey k;
+    VkDescriptorSet set;
+} g_fx_last;
 
 static gboolean fx_equal(gconstpointer a, gconstpointer b)
 {
@@ -539,7 +558,23 @@ static bool fixed_init(void)
 }
 
 /* k's set in the current command buffer's pools, made the first time */
+static VkDescriptorSet fixed_set_new(const FixedKey *k);
+
 static VkDescriptorSet fixed_set(const FixedKey *k)
+{
+    if (g_fx_last.valid && !memcmp(&g_fx_last.k, k, sizeof(*k))) {
+        return g_fx_last.set;
+    }
+    VkDescriptorSet set = fixed_set_new(k);
+    if (set) {
+        g_fx_last.valid = true;
+        g_fx_last.k = *k;
+        g_fx_last.set = set;
+    }
+    return set;
+}
+
+static VkDescriptorSet fixed_set_new(const FixedKey *k)
 {
     __typeof__(g_dr.fx[0]) *f = &g_dr.fx[g_dr.fxslot];
     VkDescriptorSet set = (VkDescriptorSet)g_hash_table_lookup(f->sets, k);
@@ -619,6 +654,7 @@ void hle_draw_slot(unsigned slot)
     if (!g_hvk.caps.bindless && g_dr.mirror) {  /* its previous recording has completed */
         __typeof__(g_dr.fx[0]) *f = &g_dr.fx[g_dr.fxslot = slot % HLE_FRAMES];
         g_hash_table_remove_all(f->sets);
+        g_fx_last.valid = false;
         for (unsigned i = 0; i < f->npool; i++) {
             T.vkResetDescriptorPool(g_hvk.dev, f->pool[i], 0);
         }
@@ -626,8 +662,19 @@ void hle_draw_slot(unsigned slot)
     }
 }
 
+/* malisx2's vkCmdSetIndexRangeMALISX2 (NULL elsewhere): an indexed draw's
+ * index range, which the front end knows (HleCmdDraw vcount). The driver
+ * otherwise reads every draw's indices back from the arena to find it, and
+ * on the Mali-G52 that scan of uncached memory was half of each draw's CPU
+ * time (2.2 of 4.6 us, ~100 ms a second in a race). */
+typedef void(VKAPI_PTR *PFN_SetIndexRange)(VkCommandBuffer cb, uint32_t first, uint32_t count,
+                                           uint32_t min, uint32_t max);
+static PFN_SetIndexRange g_set_index_range;
+
 int hle_draw_init(void)
 {
+    g_set_index_range = (PFN_SetIndexRange)vkGetDeviceProcAddr(g_hvk.dev,
+                                                               "vkCmdSetIndexRangeMALISX2");
     VkDescriptorSetLayoutBinding b[4] = {
         { 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, HLE_MAX_IMAGES, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
         { 1, VK_DESCRIPTOR_TYPE_SAMPLER, HLE_MAX_SAMPLERS, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
@@ -850,36 +897,70 @@ static void white_init(VkCommandBuffer cb)
 
 /* ---- textures ------------------------------------------------------------------ */
 
-/* Lookup by id (many per draw): a per-id hint, checked on use, and misses
- * remembered until a texture is created (g_tex_gen). */
-#define TEX_IDS 8193
-static uint16_t g_tex_hint[TEX_IDS];
-static uint32_t g_tex_miss[TEX_IDS], g_tex_gen = 1;
+/* Lookup by id (many per draw): an open-addressed index of the live ones,
+ * id -> slot + 1 (linear probing, removal by backward shift). It was a hint
+ * per id below 8193 and misses remembered until a texture was created:
+ * ids past that (a long session's: Sega GT 2002 defines ~100 textures a
+ * second) and each surface sampled as a texture after any creation scanned
+ * all HLE_MAX_TEX slots, several times a draw (~4% of the render thread
+ * mid-race, growing). g_tex_gen: creations, for caches of others. */
+#define TEX_MAP 4096                    /* a power of two, twice HLE_MAX_TEX */
+static uint16_t g_tex_map[TEX_MAP];
+static uint32_t g_tex_gen = 1;
+
+static unsigned tex_map_home(uint32_t id)
+{
+    return (id * 2654435761u) >> (32 - 12);
+}
+
+static void tex_map_put(const HleVkTex *t)
+{
+    unsigned i = tex_map_home(t->id);
+    while (g_tex_map[i]) {
+        i = (i + 1) & (TEX_MAP - 1);
+    }
+    g_tex_map[i] = (uint16_t)(t - g_dr.tex + 1);
+}
+
+static void tex_map_del(const HleVkTex *t)
+{
+    const uint16_t v = (uint16_t)(t - g_dr.tex + 1);
+    unsigned i = tex_map_home(t->id);
+    while (g_tex_map[i] && g_tex_map[i] != v) {
+        i = (i + 1) & (TEX_MAP - 1);
+    }
+    if (!g_tex_map[i]) {
+        return;
+    }
+    /* the entries after it in its run that may not stay behind a gap move up */
+    for (unsigned k = i;;) {
+        g_tex_map[i] = 0;
+        for (;;) {
+            k = (k + 1) & (TEX_MAP - 1);
+            if (!g_tex_map[k]) {
+                return;
+            }
+            const unsigned h = tex_map_home(g_dr.tex[g_tex_map[k] - 1].id);
+            /* home cyclically in (i, k]: it stays */
+            if (i <= k ? (h <= i || h > k) : (h <= i && h > k)) {
+                break;
+            }
+        }
+        g_tex_map[i] = g_tex_map[k];
+        i = k;
+    }
+}
 
 static HleVkTex *tex_find(uint32_t id)
 {
     if (!id) {
         return NULL;
     }
-    if (id < TEX_IDS) {
-        unsigned h = g_tex_hint[id];
-        if (h && g_dr.tex[h - 1].id == id) {
-            return &g_dr.tex[h - 1];
+    for (unsigned i = tex_map_home(id); g_tex_map[i]; i = (i + 1) & (TEX_MAP - 1)) {
+        HleVkTex *t = &g_dr.tex[g_tex_map[i] - 1];
+        if (t->id == id) {
+            return t;
         }
-        if (g_tex_miss[id] == g_tex_gen) {
-            return NULL;
-        }
-    }
-    for (unsigned i = 0; i < HLE_MAX_TEX; i++) {
-        if (g_dr.tex[i].id == id) {
-            if (id < TEX_IDS) {
-                g_tex_hint[id] = i + 1;
-            }
-            return &g_dr.tex[i];
-        }
-    }
-    if (id < TEX_IDS) {
-        g_tex_miss[id] = g_tex_gen;
     }
     return NULL;
 }
@@ -899,6 +980,7 @@ static unsigned g_nretire;
 static uint32_t g_free_slot[HLE_MAX_IMAGES];
 static unsigned g_nfree_slot;
 static uint64_t g_tex_retired;
+bool g_hle_texnew = true;
 
 void hle_draw_tex_reap(uint64_t completed)
 {
@@ -931,16 +1013,38 @@ void hle_draw_tex_stamp(uint64_t value)
     }
 }
 
+/* Room for one more retired entry. Full: everything submitted is waited
+ * for and reaped; what the open recording retired (HLE_SURF_PARKED) stays,
+ * so a table full of those has none (the entry is then leaked, not written
+ * past the end). */
+static bool retire_room(void)
+{
+    if (g_nretire < TEX_RETIRE_MAX) {
+        return true;
+    }
+    hle_tl_wait(hle_tl_submitted());
+    hle_draw_tex_reap(hle_tl_completed());
+    if (g_nretire < TEX_RETIRE_MAX) {
+        return true;
+    }
+    static bool s_said;
+    if (!s_said) {
+        s_said = true;
+        hle_log("hakuX-hle-back", "retired textures: %u in one recording, the table's size: "
+                "later ones leaked (logged once)", TEX_RETIRE_MAX);
+    }
+    return false;
+}
+
 static void tex_free(HleVkTex *t)
 {
-    if (t->img) {
-        if (g_nretire == TEX_RETIRE_MAX) {
-            hle_tl_wait(hle_tl_submitted());    /* full: everything before is done */
-            hle_draw_tex_reap(hle_tl_completed());
-        }
+    if (t->img && retire_room()) {
         g_retire[g_nretire++] = (typeof(g_retire[0])){
             .img = t->img, .view = t->view, .cube_view = t->cube_view, .mem = t->mem,
             .slot = t->slot, .after = HLE_SURF_PARKED };
+    }
+    if (t->id) {
+        tex_map_del(t);
     }
     memset(t, 0, sizeof(*t));
 }
@@ -964,7 +1068,7 @@ static uint32_t level_bytes(uint32_t xfmt, uint32_t w, uint32_t h, uint32_t *row
     return *row * h;
 }
 
-void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer cb)
+void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer (*get_cb)(bool fresh))
 {
     TexFmt tf;
     if (g_dr.ready && !tex_format(c->xfmt, &tf)) {
@@ -981,8 +1085,20 @@ void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer cb)
     }
     HleVkTex *t = tex_find(c->id);
     uint32_t cd = c->faces == 1 && c->d > 1 ? c->d : 1;
-    if (t && (t->xfmt != c->xfmt || t->w != c->w || t->h != c->h || t->levels != c->levels ||
-              t->faces != c->faces || t->d != cd)) {
+    /* Every definition gets an image of its own, a redefinition too: the
+     * old one retires (tex_free) with the work that samples it, and the
+     * upload into the new one waits for nothing. Writing the old image
+     * again waits for every draw before that might sample it, and a tiler
+     * GPU holds its vertex work behind that (Mali's job manager).
+     * debug.hakux.texnew=0: off. A recording that redefines textures by the
+     * thousand (loading) fills the retired table with what it may still
+     * sample: from half full on, redefinitions write the same image again
+     * (a full table was written past its end: the likely reason Sega GT
+     * 2002's cars once sampled white). */
+    const bool texnew = g_hle_texnew && g_nretire < TEX_RETIRE_MAX / 2;
+    const bool fresh = texnew || !t;
+    if (t && (texnew || t->xfmt != c->xfmt || t->w != c->w || t->h != c->h ||
+              t->levels != c->levels || t->faces != c->faces || t->d != cd)) {
         tex_free(t);
         t = NULL;
     }
@@ -1004,6 +1120,7 @@ void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer cb)
         *t = (HleVkTex){ .id = c->id, .xfmt = c->xfmt, .w = c->w, .h = c->h, .d = cd,
                          .levels = c->levels, .faces = c->faces, .fmt = tf.fmt,
                          .vol = cd > 1 };
+        tex_map_put(t);
         g_tex_gen++;                    /* remembered misses may now hit */
         if (!make_image(t, &tf, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
             static unsigned s_fail;
@@ -1011,6 +1128,7 @@ void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer cb)
                 hle_log("hakuX-hle-back", "texture %u (%ux%u fmt 0x%x): image not created "
                         "(sampled white)", c->id, c->w, c->h, c->xfmt);
             }
+            tex_map_del(t);
             t->id = 0;
             return;
         }
@@ -1018,9 +1136,10 @@ void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer cb)
         t->linear = (hle_fmt_info(c->xfmt)->flags & HLE_FI_LIN) != 0;
         write_tex_slot(t);
     }
-    VkImageMemoryBarrier2 b = {
+    VkCommandBuffer cb = get_cb(fresh);
+    VkImageMemoryBarrier2 b = {         /* a new image (texnew): nothing used it before */
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        .srcStageMask = fresh ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
         .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
         .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -1119,12 +1238,10 @@ void hle_draw_forget_surf(uint32_t id)
             i++;
             continue;
         }
-        if (g_nretire == TEX_RETIRE_MAX) {
-            hle_tl_wait(hle_tl_submitted());
-            hle_draw_tex_reap(hle_tl_completed());
+        if (retire_room()) {
+            g_retire[g_nretire++] = (typeof(g_retire[0])){
+                .slot = g_dr.sslot[i].slot, .after = HLE_SURF_PARKED };
         }
-        g_retire[g_nretire++] = (typeof(g_retire[0])){
-            .slot = g_dr.sslot[i].slot, .after = HLE_SURF_PARKED };
         g_dr.sslot[i] = g_dr.sslot[--g_dr.nsslot];
     }
 }
@@ -1404,6 +1521,7 @@ void hle_draw_tex_prep(const HleCmdDraw *c, uint32_t rt_id, VkCommandBuffer cb)
     for (unsigned st = 0; st < HLE_TSS_STAGES; st++) {
         HleVkSurf *s = tex_surface(c->tex[st], rt_id);
         if (s) {
+            s->sampled = true;
             if (s->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
                 /* its texels are undefined: nothing rendered into it yet */
                 static unsigned s_logged;
@@ -1535,6 +1653,7 @@ static int snap_get(const HleVkSurf *rt)
 
 void hle_draw_snap(VkCommandBuffer cb, HleVkSurf *rt)
 {
+    hle_passlog_event("snapshot of", rt->id, 0);
     int i = snap_get(rt);
     g_snap_cur = i;
     g_snap_rt = rt->id;
@@ -1595,9 +1714,10 @@ static uint32_t sampler_index(const uint32_t *tss, uint32_t lod_down)
                    (uint64_t)(tss[TSS_ADDRESSW] & 7) << 15 | (uint64_t)base << 18 |
                    (uint64_t)tss[TSS_BORDERCOLOR] << 32;
     uint64_t key2 = tss[TSS_MIPMAPLODBIAS] | (uint64_t)lod_down << 32;
-    /* one per stage a draw: the index last found for the key's hash, before the scan */
-    static uint16_t hot[64];
-    unsigned h = (unsigned)(((key ^ key2 * 0x9E3779B97F4A7C15ull) * 0xFF51AFD7ED558CCDull) >> 58);
+    /* one per stage a draw: the index last found for the key's hash, before the scan
+     * (64 of them collided often enough to be ~2% of the render thread) */
+    static uint16_t hot[1024];
+    unsigned h = (unsigned)(((key ^ key2 * 0x9E3779B97F4A7C15ull) * 0xFF51AFD7ED558CCDull) >> 54);
     uint32_t i = hot[h];
     if (i < g_dr.nsmp && g_dr.smp[i].key == key && g_dr.smp[i].key2 == key2) {
         return i;
@@ -2404,16 +2524,42 @@ static unsigned g_rt_told;
  * share one object (object_view). Fable draws a lock-on's silhouette into
  * a swizzled 256 x 256 target through its linear view and blurs it from
  * there with a linear texture, by texel; addressed normalized, as the
- * swizzled object, every tap clamped to the corner and the halo was gone.
- * A linear surface's texel coordinates are divided by the surface's own
- * scale, so the bit that has the shaders divide (8 + st) is set for a
- * surface at the resolution scale only: a small target renders at 1x
- * (surf_scale), and divided by the device's scale its texel coordinates
- * were multiplied by it: at 2x the whole target came in a quarter of the
- * area it was drawn over, the rest read past its edges as the stage
- * addresses them (reported for Sega GT 2002's car skins, twelve 64 x 64
- * targets a frame, read by texel). */
-static uint32_t stage_slot(const HleCmdDraw *c, unsigned st, uint32_t rt_id, uint32_t *flags)
+ * swizzled object, every tap clamped to the corner and the halo was gone. */
+/* A surface's scale as the 2 bits the shaders read (ff.h HLE_SSCL_GLSL),
+ * at its stage's slot in flags' top byte (24 + 2 * stage):
+ * 0: 1x (guest-resolution surfaces), 1: 0.5x, 2: 2x, 3: 4x */
+static uint32_t sscl_code(uint32_t e8, unsigned st)
+{
+    uint32_t code = e8 == 4 ? 1 : e8 == 16 ? 2 : e8 == 32 ? 3 : 0;
+    return code << (24u + 2u * st);
+}
+
+/* Why a stage with a texture sampled the white one (stage_slot); "self":
+ * the target the draw renders, which fbfetch may read instead */
+enum { WHITE_UNKNOWN, WHITE_VIEW, WHITE_NOIMG, WHITE_SELF, WHITE_LAYOUT, WHITE_SLOTS, WHITE_N };
+static const char *const k_white_names[WHITE_N] = { "unknown", "view", "noimg", "self",
+                                                    "layout", "slots" };
+
+static void white_count(uint32_t id, uint32_t rt_id)
+{
+    HleVkSurf *s = hle_surf_get(id);
+    const unsigned why = !s ? WHITE_UNKNOWN : s->d.parent ? WHITE_VIEW : !s->img ? WHITE_NOIMG :
+                         id == rt_id && !s->general ? WHITE_SELF :
+                         !s->general && s->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ?
+                         WHITE_LAYOUT : WHITE_SLOTS;
+    g_dr.whites[why]++;
+    static uint32_t s_told[WHITE_N];
+    if (s_told[why] < 6) {
+        s_told[why]++;
+        hle_log("hakuX-hle-drawlog", "white: tex %u (%s) rt %u: %ux%u xfmt 0x%x parent %u level "
+                "%u face %u layout %d", id, k_white_names[why], rt_id, s ? s->d.w : 0,
+                s ? s->d.h : 0, s ? s->d.xfmt : 0, s ? s->d.parent : 0, s ? s->d.level : 0,
+                s ? s->d.face : 0, s ? (int)s->layout : -1);
+    }
+}
+
+static uint32_t stage_slot(const HleCmdDraw *c, unsigned st, uint32_t rt_id, uint32_t *flags,
+                           uint32_t *scl)
 {
     HleVkTex *tx = tex_find(c->tex[st]);
     HleVkSurf *ts = tx ? NULL : tex_surface(c->tex[st], rt_id);
@@ -2425,16 +2571,21 @@ static uint32_t stage_slot(const HleCmdDraw *c, unsigned st, uint32_t rt_id, uin
     } else if (c->tex[st] == rt_id && g_snap_cur >= 0 && g_snap_rt == rt_id &&
                (rt = hle_surf_get(rt_id)) != NULL) {
         slot = g_snap[g_snap_cur].slot;  /* the target, copied before the draw */
-        *flags |= (c->tex_lin >> st & 1) ? (1u << st) | (rt->scale > 1 ? 256u << st : 0) : 0;
+        hle_passlog_sampled(rt_id);
+        *flags |= (c->tex_lin >> st & 1) ? (1u << st) | (256u << st) : 0;
+        *scl |= sscl_code(rt->scale, st);
         return slot;
     } else if (ts && (ts->general || ts->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)) {
         slot = surf_slot(ts, c->tex_ord >> 2 * st & 3);  /* RT as texture (identity) */
-        /* linear format: texel coords, of an image at the resolution scale
-         * (bit 8 + st) or at 1x (a small target, surf.c surf_scale: its
-         * texels are its own, and the scale must not divide them) */
-        *flags |= (c->tex_lin >> st & 1) ? (1u << st) | (ts->scale > 1 ? 256u << st : 0) : 0;
+        hle_passlog_sampled(ts->id);
+        /* linear format: texel coords, of the surface's own scale */
+        *flags |= (c->tex_lin >> st & 1) ? (1u << st) | (256u << st) : 0;
+        *scl |= sscl_code(ts->scale, st);
     }
     uint32_t id = c->tex[st];
+    if (id && !slot) {
+        white_count(id, rt_id);
+    }
     if (id && !tx && id < 8192 && g_rt_told < 64 && !(g_rt_seen[id >> 3] >> (id & 7) & 1)) {
         g_rt_seen[id >> 3] |= 1u << (id & 7);
         g_rt_told++;
@@ -3256,6 +3407,7 @@ static void fixed_bind(VkCommandBuffer cb, HleFfPush *pc)
         g_rec.set0 = set;
         T.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_dr.layout, 0, 1, &set,
                                   0, NULL);
+        g_dr.emits[EM_SET0]++;
     }
 }
 
@@ -3462,10 +3614,11 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
         fs->alphaarg1 = t[TSS_ALPHAARG1];
         fs->alphaarg2 = t[TSS_ALPHAARG2];
         fs->resultarg = t[TSS_RESULTARG];
-        uint32_t lin = 0;
+        uint32_t lin = 0, scl = 0;
         /* fixed-function shadow buffers: not yet (white, as before) */
-        uint32_t slot = shadow_fmt(c->tex[st]) ? 0 : stage_slot(c, st, rt_id, &lin);
-        pc.flags |= (lin >> st & 1) << ki | (lin >> (st + 8) & 1) << (ki + 8);
+        uint32_t slot = shadow_fmt(c->tex[st]) ? 0 : stage_slot(c, st, rt_id, &lin, &scl);
+        pc.flags |= (lin >> st & 1) << ki | (lin >> (st + 8) & 1) << (ki + 8) |
+                    (scl >> (24u + 2u * st) & 3u) << (24u + 2u * ki);
         fs->texture = c->tex[st] != 0;
         fs->unset = c->tex_unset >> st & 1;
         fs->alpha_kill = fs->texture && t[TSS_ALPHAKILL] != 0;
@@ -3481,8 +3634,10 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
         memset(&k.ps, 0, sizeof(k.ps));
         pc.flags = 0;
         for (unsigned st = 0; st < HLE_FF_STAGES; st++) {
-            pc.tex[st] = stage_slot(c, st, rt_id, &pc.flags) |
+            uint32_t sflags = 0, scl = 0;
+            pc.tex[st] = stage_slot(c, st, rt_id, &sflags, &scl) |
                          sampler_index(s->tss[st], stage_lod_down(c, st, rt_id)) << 16;
+            pc.flags |= sflags | scl;
             k.vs.texcoord[st] = s->tss[st][TSS_TEXCOORDINDEX] & 7;
         }
         k.vs.ntex = HLE_FF_STAGES;
@@ -3837,8 +3992,8 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
             k.ps.fbfetch |= (uint8_t)g_hle_zeq;
         }
     }
-    /* the slope is per guest pixel; the target has scale pixels to one */
-    zslope *= (float)(rt ? rt->scale : ds->scale);
+    /* the slope is per guest pixel; the target has scale/8 pixels to one */
+    zslope *= (float)(rt ? rt->scale : ds->scale) / 8.0f;
     if (wbuf && wff) {
         /* the offsets are in depth-buffer units; vW is w here */
         float f = c->zscale / c->wscale;
@@ -3945,18 +4100,19 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
      * depth range. */
     uint32_t tw = rt ? rt->d.w : ds->d.w, th = rt ? rt->d.h : ds->d.h;
     uint32_t sw = rt ? rt->w : ds->w, sh = rt ? rt->h : ds->h;
-    uint32_t rs = rt ? rt->scale : ds->scale;
+    uint32_t rs = rt ? rt->scale : ds->scale;      /* eighths */
     bool full = !vpc->w || !vpc->h;
     VkRect2D sc = full ? (VkRect2D){ { 0, 0 }, { sw, sh } } :
-                         (VkRect2D){ { (int32_t)(vpc->x * rs), (int32_t)(vpc->y * rs) },
-                                     { vpc->w * rs, vpc->h * rs } };
+                         (VkRect2D){ { (int32_t)hle_rs_px(vpc->x, rs),
+                                       (int32_t)hle_rs_px(vpc->y, rs) },
+                                     { hle_rs_px(vpc->w, rs), hle_rs_px(vpc->h, rs) } };
     if (vpc->clip) {
         /* SetScissors' rectangle replaces the viewport as the clip */
         int32_t x1 = MAX(vpc->cx1, 0), y1 = MAX(vpc->cy1, 0);
         int32_t x2 = MIN(vpc->cx2, (int32_t)tw), y2 = MIN(vpc->cy2, (int32_t)th);
-        sc = (VkRect2D){ { x1 * (int32_t)rs, y1 * (int32_t)rs },
-                         { x2 > x1 ? (uint32_t)(x2 - x1) * rs : 0,
-                           y2 > y1 ? (uint32_t)(y2 - y1) * rs : 0 } };
+        sc = (VkRect2D){ { x1 * (int32_t)rs / 8, y1 * (int32_t)rs / 8 },
+                         { x2 > x1 ? hle_rs_px((uint32_t)(x2 - x1), rs) : 0,
+                           y2 > y1 ? hle_rs_px((uint32_t)(y2 - y1), rs) : 0 } };
     }
     if (g_hle_gpucut == 1 || g_hle_gpucut == 4) {
         sc = (VkRect2D){ { 0, 0 }, { 1, 1 } };  /* debug: next to no fragments */
@@ -3998,10 +4154,9 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
     pc.zscale = wbuf && wff ? c->wscale : c->zscale;
     pc.tfactor = s->rs[RS_TEXTUREFACTOR];
     pc.alpha_ref = (s->rs[RS_ALPHAREF] & 0xFF) / 255.0f;
-    memcpy(&pc.fog[3], &rect, 4);       /* (bits: HLE_NVRECT_GLSL) */
-    /* the target's scale (point sizes, texel edges) and the scaled linear
-     * surfaces' (stage_slot); antialiased: texel edges as they are (ff.h) */
-    pc.flags |= MIN(rs, 255u) << 16 | MIN(g_hle_rscale, 255u) << 24 |
+    /* the target's scale (point sizes, texel edges), in eighths; bits 24-31
+     * hold each stage's linear surface's own scale (set in stage_slot) */
+    pc.flags |= MIN(rs, 255u) << 16 |
                 (aax > 1.0f || aay > 1.0f ? HLE_TEXEL_EDGE_FLAG : 0u) | (g_snap_trunc ? HLE_SNAP_TRUNC_FLAG : 0u);
     if (!g_hvk.caps.bindless) {
         fixed_bind(cb, &pc);            /* the textures a set of the draw's own */
@@ -4222,6 +4377,28 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
         } else {
             g_dr.mergeable++;
         }
+        {
+            static uint64_t pe[EM_N], pbreaks;
+            static uint32_t pprim;
+            static bool pvalid, pidx;
+            uint64_t other = 0;
+            for (unsigned i = 0; i < EM_N; i++) {
+                if (i != EM_SET1 && i != EM_VB) {
+                    other += g_dr.emits[i] - pe[i];
+                }
+            }
+            const bool idx = c->ib_off != UINT32_MAX;
+            if (pvalid && !other && hle_back_breaks == pbreaks && pprim == c->prim && pidx == idx) {
+                g_dr.batchable++;
+                g_dr.batch_consts += g_dr.emits[EM_SET1] != pe[EM_SET1];
+                g_dr.batch_vb += g_dr.emits[EM_VB] != pe[EM_VB];
+            }
+            memcpy(pe, g_dr.emits, sizeof(pe));
+            pbreaks = hle_back_breaks;
+            pprim = c->prim;
+            pidx = idx;
+            pvalid = true;
+        }
         /* indexed: no state since the previous indexed draw (same topology),
          * and of those, the ones whose indices also follow its own at the
          * same vertex base (one draw as they are) */
@@ -4258,8 +4435,11 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
         int q = g_probe.nvsh ? probe_begin(cb, c, vfirst, (uint64_t)(uintptr_t)g_rec.pipe)
                                 : -1;
         if (g_hle_gpucut != 2) {
-            T.vkCmdDrawIndexed(cb, g_hle_gpucut == 4 ? MIN(c->count, 3u) : c->count, 1,
-                               c->ib_off / 2, (int32_t)vfirst, 0);
+            const uint32_t n = g_hle_gpucut == 4 ? MIN(c->count, 3u) : c->count;
+            if (g_set_index_range && c->vcount) {
+                g_set_index_range(cb, c->ib_off / 2, n, 0, c->vcount - 1);
+            }
+            T.vkCmdDrawIndexed(cb, n, 1, c->ib_off / 2, (int32_t)vfirst, 0);
         }
         if (q >= 0) {
             T.vkCmdEndQuery(cb, g_probe.pool, (uint32_t)q);
@@ -4328,7 +4508,7 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
 void hle_draw_ff_diag(void)
 {
     static uint64_t prev[EM_N], prev_draws, prev_merge, prev_no[5], prev_verts;
-    char line[512];
+    char line[768];
     int n = snprintf(line, sizeof(line), "per s: draws=%llu verts=%llu mergeable=%llu (not: strip "
                      "%llu idx %llu state %llu work %llu gap %llu)",
                      (unsigned long long)(g_dr.draws - prev_draws),
@@ -4354,10 +4534,26 @@ void hle_draw_ff_diag(void)
                   (unsigned long long)(g_dr.idx_contig - prev_icontig));
     prev_isame = g_dr.idx_same;
     prev_icontig = g_dr.idx_contig;
+    static uint64_t prev_bt, prev_btc, prev_btv;
+    n += snprintf(line + n, sizeof(line) - (size_t)n, " batchable=%llu (consts %llu vb %llu)",
+                  (unsigned long long)(g_dr.batchable - prev_bt),
+                  (unsigned long long)(g_dr.batch_consts - prev_btc),
+                  (unsigned long long)(g_dr.batch_vb - prev_btv));
+    prev_bt = g_dr.batchable;
+    prev_btc = g_dr.batch_consts;
+    prev_btv = g_dr.batch_vb;
     for (unsigned i = 0; i < EM_N && n > 0 && (size_t)n < sizeof(line); i++) {
         n += snprintf(line + n, sizeof(line) - (size_t)n, " %s=%llu", k_em_names[i],
                       (unsigned long long)(g_dr.emits[i] - prev[i]));
         prev[i] = g_dr.emits[i];
+    }
+    {
+        static uint64_t pw[WHITE_N];
+        for (unsigned i = 0; i < WHITE_N && n > 0 && (size_t)n < sizeof(line); i++) {
+            n += snprintf(line + n, sizeof(line) - (size_t)n, "%s%s=%llu", i ? " " : " white: ",
+                          k_white_names[i], (unsigned long long)(g_dr.whites[i] - pw[i]));
+            pw[i] = g_dr.whites[i];
+        }
     }
     prev_draws = g_dr.draws;
     prev_verts = g_dr.verts;

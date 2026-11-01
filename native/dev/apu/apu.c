@@ -25,6 +25,7 @@
 #include "native/core/mmio.h"
 #include "native/core/vm.h"
 #include "native/dev/dev.h"
+#include "hw/xbox/hle/util/thread.h"
 
 /* HAKUX_APU_STATS=1 -> 1 Hz hakuX-apu line (audio evidence) */
 static bool g_apu_stats;
@@ -82,6 +83,10 @@ void apu_thread_start(pthread_t *t, const char *name, void *(*fn)(void *), void 
     pthread_attr_setstacksize(&attr, 8u << 20);
     pthread_create(t, &attr, fn, arg);
     pthread_attr_destroy(&attr);
+#ifdef __ANDROID__
+    /* the audio threads keep off the cores the frame waits on (util/thread.h) */
+    hle_thread_role_tid(HLE_PIN_AUDIO, pthread_gettid_np(*t));
+#endif
     char n[16];
     snprintf(n, sizeof(n), "%s", name);
     pthread_setname_np(*t, n);

@@ -310,12 +310,33 @@ static uint32_t arena(uint32_t len, uint8_t **ptr)
 /* A draw's 16-bit indices: the index buffer is bound at the arena's start
  * (firstIndex), so 16 bytes apart will do where 256 wasted ~120 bytes a
  * draw, and back-to-back draws' indices end up contiguous more often (the
- * back end's strip batching). Vertex copies stay 256 apart: their binding
- * offsets then match from draw to draw, which that batching needs. */
+ * back end's strip batching). */
 static uint32_t arena_idx(uint32_t len, uint8_t **ptr)
 {
     g_phase = 1;
     uint32_t off = hle_draw_arena_alloc16(len, ptr);
+    g_phase = 0;
+    return off;
+}
+
+/* A vertex copy of a draw with one binding of stride st: at a multiple of
+ * the stride (and of 4), so that first_vertex() (vk/draw.c) folds all of
+ * the offset into firstVertex and leaves the binding at offset 0, the
+ * same for every such draw. 256 apart, as before, only kept the binding
+ * when the stride divided 256: with strides such as 24, 28 or 36 the
+ * binding moved every draw, which ended every strip run (the back end's
+ * strip batching needs nothing recorded between the draws) and cost a
+ * vertex buffer bind a draw (vb=28308/s for 37335 draws/s in Sega GT
+ * 2002's races). Draws with more bindings keep 256: their bindings do not
+ * share one firstVertex anyway. */
+static uint32_t arena_vb(uint32_t len, uint32_t st, unsigned nbind, uint8_t **ptr)
+{
+    uint32_t align = 256;
+    if (nbind == 1 && st) {
+        align = st % 4 ? st * (st % 2 ? 4 : 2) : st;
+    }
+    g_phase = 1;
+    uint32_t off = hle_draw_arena_alloc_at(len, align, ptr);
     g_phase = 0;
     return off;
 }
@@ -1394,6 +1415,57 @@ static void front_stale(const PbObj *o)
 
 static void shown_part(const PbObj *o, uint32_t ax, uint32_t ay, uint32_t *w, uint32_t *h);
 
+/* The frame pace (pbmode.c's decode loop stalls on it): without it the
+ * guest's push ring holds however far the renderer is behind (Sega GT 2002
+ * on a Mali-G52: ~25 frames, the flip reaching the display 1030-1130 ms
+ * later) and the pad is read by a simulation the screen shows a second
+ * later. After a swap the decoder stops, as at a FLIP_STALL, until the GPU
+ * has finished the swap `depth` before it; the ring fills, and the guest,
+ * stalling on ring space in its own frame loop, throttles itself to the
+ * render pace. Two back by default: one frame queued behind the one the
+ * GPU runs, so it never runs dry at the swap. The wait is a timeline note
+ * that kicks the decoder, which meanwhile serves the guest's stores and
+ * render-target reads (it is stalled, not blocked). The app's "Frame
+ * pacing" setting, on by default; debug.hakux.pace (0 off, 1-3 swaps back)
+ * overrides it, read at each swap so an A/B needs no restart. */
+static struct {
+    uint64_t swap[4];                   /* the last swaps' values, by g_pd.swaps */
+    uint64_t want;                      /* the value the decoder stalls for */
+    uint32_t seq, reached;              /* stalls, and the last the GPU reached (atomic) */
+} g_pace;
+
+static void pace_landed(uint32_t seq, bool landed)
+{
+    __atomic_store_n(&g_pace.reached, seq, __ATOMIC_RELEASE);
+    hle_pb_kick();
+}
+
+bool hle_pbd_pace_reached(void)
+{
+    return __atomic_load_n(&g_pace.reached, __ATOMIC_ACQUIRE) == g_pace.seq ||
+           hle_tl_completed() >= g_pace.want;
+}
+
+bool hle_pbd_pace(void)
+{
+    char v[PROP_VALUE_MAX];
+    hle_prop_get("debug.hakux.pace", v);
+    int depth = v[0] ? atoi(v) : hle_host_frame_pace() ? 2 : 0;
+    depth = MIN(depth, 3);
+    if (depth <= 0 || g_pd.swaps <= (uint64_t)depth) {
+        return false;
+    }
+    g_pace.want = g_pace.swap[(g_pd.swaps - depth) % ARRAY_SIZE(g_pace.swap)];
+    if (hle_tl_completed() >= g_pace.want) {
+        return false;
+    }
+    /* no room for the note: no kick would come, so no stall */
+    if (!hle_tl_land_note(g_pace.want, pace_landed, ++g_pace.seq)) {
+        return false;
+    }
+    return !hle_pbd_pace_reached();
+}
+
 /* FLIP_INCREMENT_WRITE: the frame in the colour target is done; it goes to
  * the display (D3D's vblank handler shows it there too). The display scans
  * out D3D's back buffer, whatever is bound: a target smaller than the
@@ -1437,10 +1509,11 @@ static void swap(void)
     __atomic_store_n(&g_pd.shown_ns, hle_now_ns(), __ATOMIC_RELAXED);
     g_pd.shown_written = fo ? fo->written : 0;
     HleCmdSwap *c = begin(HLE_OP_SWAP, sizeof(*c));
-    c->value = hle_fe_next_value();
+    const uint64_t value = c->value = hle_fe_next_value();
     c->swap_id = ++g_pd.swap_ids;
     shown_part(fo, ax, ay, &c->src_w, &c->src_h);
     g_pd.swaps++;
+    g_pace.swap[g_pd.swaps % ARRAY_SIZE(g_pace.swap)] = value;      /* (hle_pbd_pace) */
     g_pd.epoch++;
     g_pd.kick_ns = hle_now_ns();
     g_pd.vis_unsent = false;                /* a swap submits */
@@ -2880,14 +2953,31 @@ bool hle_pbd_novis(void)
 }
 
 /* debug: HAKUX_HLE_PB_KICK_MS, the periodic submit boundary's interval
- * (default 4; 0: none, a frame's swap submits) */
+ * (default 4; 0: none, a frame's swap submits); on Android also live,
+ * debug.hakux.kickms (read once a second; empty: the default). Each submit
+ * ends the open pass. */
 static int64_t kick_interval_ns(void)
 {
-    static int64_t ns = -1;
+    static int64_t ns = -1, def;
     if (ns < 0) {
         const char *e = getenv("HAKUX_HLE_PB_KICK_MS");
-        ns = e ? (int64_t)atoi(e) * 1000000 : 4000000;
+        ns = def = e ? (int64_t)atoi(e) * 1000000 : 4000000;
     }
+#ifdef __ANDROID__
+    static int64_t polled;
+    const int64_t now = hle_now_ns();
+    if (now - polled >= 1000000000) {
+        polled = now;
+        char v[PROP_VALUE_MAX];
+        hle_prop_get("debug.hakux.kickms", v);
+        const int64_t want = v[0] ? (int64_t)atoi(v) * 1000000 : def;
+        if (want != ns) {
+            ns = want;
+            hle_log("hakuX-hle-pb", "periodic submits: every %lld ms of draws (0: none)",
+                    (long long)(ns / 1000000));
+        }
+    }
+#endif
     return ns;
 }
 
@@ -3239,6 +3329,7 @@ static bool sequential(HleCmdDraw *d, uint32_t n)
     d->prim = hle_draw_prim_topology(g_pd.prim);
     d->count = cnt;
     d->ib_off = ib_off;
+    d->vcount = n;
     return true;
 }
 
@@ -3450,7 +3541,7 @@ static bool vb_realign(HleCmdDraw *d, unsigned b, const uint8_t *src, uint32_t f
     }
     const uint32_t st = d->bind_stride[b], ns = st ? ROUND_UP(end, 4u) : 0;
     uint8_t *dst;
-    const uint32_t off = arena(st ? n * ns : end, &dst);
+    const uint32_t off = arena_vb(st ? n * ns : end, ns, d->nbind, &dst);
     if (off == HLE_ARENA_FULL) {
         return false;
     }
@@ -3549,7 +3640,7 @@ static void draw_arrays(void)
             continue;
         }
         uint8_t *dst;
-        uint32_t off = src ? arena(len, &dst) : HLE_ARENA_FULL;
+        uint32_t off = src ? arena_vb(len, st, d.nbind, &dst) : HLE_ARENA_FULL;
         if (off == HLE_ARENA_FULL) {
             skip(SK_DRAW_ARRAYS_ARENA);
             return;
@@ -3606,6 +3697,7 @@ static void draw_arrays(void)
     d.prim = hle_draw_prim_topology(pt);
     d.count = cnt;
     d.ib_off = ib_off;
+    d.vcount = hi - lo + 1;
     emit(&d);
 }
 

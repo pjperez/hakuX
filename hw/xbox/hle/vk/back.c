@@ -31,6 +31,9 @@
 typedef struct HleFrame {
     VkCommandPool pool;
     VkCommandBuffer cb;
+    /* uploads into new images (tex_cb), submitted in front of cb */
+    VkCommandBuffer ucb;
+    bool ucb_open;
     uint64_t value;
 } HleFrame;
 
@@ -173,7 +176,7 @@ static void cmd_vis_end(const HleCmdVis *c)
     p->index = c->index;
     HleVkSurf *vrt = hle_surf_get(g_back.rt);
     uint32_t vsc = vrt ? vrt->scale : g_hle_rscale;
-    p->div = MAX(c->div, 1u) * vsc * vsc;               /* guest pixels */
+    p->div = MAX(c->div, 1u) * vsc * vsc / 64u;       /* guest pixels (scale in eighths) */
     p->report = c->report;
     p->expect = c->expect;
     p->nparts = g_vis.nparts;
@@ -322,6 +325,57 @@ enum { PE_OTHER, PE_SUBMIT, PE_SETRT, PE_TEX, PE_PREP, PE_LREAD, PE_SWAP, PE_COP
 static const char *const k_pe_names[PE_N] = { "other", "submit", "target", "upload",
                                               "sampled target", "local read", "swap", "copy" };
 static uint64_t g_pe[PE_N];
+
+/* debug.hakux.passlog (a new value): the next frame's passes, logged in
+ * order with what each one renders to, clears, draws and samples, and the
+ * other GPU work between them: the dependencies a pass reordering has to
+ * keep. From the swap after the value is set to the next one. */
+static struct {
+    bool arm, on, in_draw;            /* in_draw: a draw is opening the pass */
+    unsigned n, draws;
+    uint32_t rt, ds, pf;
+    uint32_t sampled[16];
+    unsigned nsampled;
+} g_pl;
+
+void hle_passlog_sampled(uint32_t surf)
+{
+    if (!g_pl.on) {
+        return;
+    }
+    for (unsigned i = 0; i < g_pl.nsampled; i++) {
+        if (g_pl.sampled[i] == surf) {
+            return;
+        }
+    }
+    if (g_pl.nsampled < 16) {
+        g_pl.sampled[g_pl.nsampled++] = surf;
+    }
+}
+
+void hle_passlog_event(const char *what, uint32_t a, uint32_t b)
+{
+    if (g_pl.on) {
+        hle_log("hakuX-hle-passlog", "  %s %u %u", what, a, b);
+    }
+}
+
+static void pl_pass_end(unsigned why)
+{
+    if (!g_pl.on) {
+        return;
+    }
+    char s[160] = "";
+    int n = 0;
+    for (unsigned i = 0; i < g_pl.nsampled && n < (int)sizeof(s) - 12; i++) {
+        n += snprintf(s + n, sizeof(s) - (size_t)n, " %u", g_pl.sampled[i]);
+    }
+    HleVkSurf *r = hle_surf_get(g_pl.rt);
+    hle_log("hakuX-hle-passlog", "pass %u: rt %u (%ux%u) ds %u%s%s draws %u samples [%s ] ended: %s",
+            g_pl.n++, g_pl.rt, r ? r->d.w : 0, r ? r->d.h : 0, g_pl.ds,
+            (g_pl.pf & HLE_CLEAR_TARGET) ? " clear-colour" : "",
+            (g_pl.pf & ~HLE_CLEAR_TARGET) ? " clear-zs" : "", g_pl.draws, s, k_pe_names[why]);
+}
 
 /* GPU time per render pass while the profile is on (debug): bottom-of-pipe
  * timestamps before and after each pass (the earlier work done, then this
@@ -481,6 +535,8 @@ static void pt_collect(unsigned slot)
     memset(g_pt.sum, 0, sizeof(g_pt.sum));
 }
 
+static bool g_cmdbar_full;              /* debug.hakux.cmdbar=full (cb_get) */
+
 static VkCommandBuffer cb_get(void)
 {
     HleFrame *f = &g_back.fr[g_back.cur];
@@ -500,13 +556,34 @@ static VkCommandBuffer cb_get(void)
         {   /* Earlier submissions' writes before this one's commands: a frame
              * split by a kick resumes its pass here and loads the attachments
              * the last submission stored. Submission order orders execution,
-             * not memory. */
+             * not memory. What the GPU writes is attachments and transfer
+             * destinations (the shaders store nothing), and what reads them
+             * is fragment work and transfers: the vertex stages read only
+             * what the CPU wrote (the arena), and the NV2A's vertex programs
+             * sample nothing. So the vertex stages are left out; "all
+             * commands" made a tiler GPU (Mali's job manager) hold every
+             * submission's vertex work until all earlier fragment work had
+             * finished, four times a frame. debug.hakux.cmdbar=full: all. */
             VkMemoryBarrier2 mb = {
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
-                .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                 .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT };
+            if (g_cmdbar_full) {
+                mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+                mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            }
             VkDependencyInfo di = {
                 .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
                 .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
@@ -649,6 +726,13 @@ static bool open_pass(bool lrz_off)
         VkClearRect zr = { .rect = ri.renderArea, .baseArrayLayer = 0, .layerCount = 1 };
         T.vkCmdClearAttachments(cb, 1, &za, 1, &zr);
     }
+    if (g_pl.on) {
+        g_pl.rt = g_back.rt;
+        g_pl.ds = g_back.ds;
+        g_pl.pf = pf;
+        g_pl.draws = g_pl.in_draw;      /* the draw that opens it, counted before */
+        g_pl.nsampled = 0;
+    }
     g_back.pass_open = true;
     g_back.zeq_wgen = 0;
     g_back.pend_clear = false;
@@ -692,6 +776,7 @@ static void close_pass_why(unsigned why)
         pt_pass_end(g_back.fr[g_back.cur].cb);
         g_back.pass_open = false;
         g_back.st.passes++;
+        pl_pass_end(why);
         g_pe[why]++;
     }
 }
@@ -722,6 +807,18 @@ static struct {
  * waiter hurries them: fewer submits, each of which ends the open pass) */
 static int64_t g_pend_ns = HLE_PEND_NS;
 static bool g_dry_hold;
+/* While a pass is open, a boundary no one waits for may wait this long
+ * (debug.hakux.pendopenus, live; 0: as without a pass): it goes out when
+ * the pass ends for another reason (cmd_set_rt) instead of splitting it.
+ * Sega GT 2002's 640x720 scene was split twice a frame by them, each a
+ * reload and a store of its colour and depth on the Mali-G52. */
+#define HLE_PEND_OPEN_NS 4000000
+static int64_t g_pend_open_ns = HLE_PEND_OPEN_NS;
+
+static inline int64_t pend_limit(void)
+{
+    return g_back.pass_open && g_pend_open_ns > g_pend_ns ? g_pend_open_ns : g_pend_ns;
+}
 
 static void submit(uint64_t value);
 
@@ -742,7 +839,7 @@ static void pend_boundary(uint64_t value)
         g_pend.since = now;
     }
     g_pend.value = value;
-    if (++g_pend.n >= 16 || now - g_pend.since >= g_pend_ns ||
+    if (++g_pend.n >= 16 || now - g_pend.since >= pend_limit() ||
         hle_atomic_read(&g_pend.urgent)) {
         pend_flush();
     }
@@ -752,33 +849,85 @@ static void pend_boundary(uint64_t value)
  * progress waiter hurries (or made urgent), is submitted */
 static inline void pend_age_check(void)
 {
-    if (unlikely(g_pend.n) && (hle_now_ns() - g_pend.since >= g_pend_ns ||
+    if (unlikely(g_pend.n) && (hle_now_ns() - g_pend.since >= pend_limit() ||
                                hle_atomic_read(&g_pend.urgent))) {
         pend_flush();
     }
 }
 
+/* debug.hakux.texhoist=0: every texture upload ends the open pass, in the
+ * frame's own command buffer */
+static bool g_tex_hoist_off;
+/* debug.hakux.prepearly=0: sampled targets turn into textures only when a
+ * draw samples them (cmd_set_rt) */
+static bool g_prep_early_off;
+
+/*
+ * The command buffer a texture upload goes in (hle_draw_cmd_tex). Into a
+ * new image (fresh), which no draw recorded so far can sample: the frame's
+ * upload command buffer, which the submit puts in front of the frame's own,
+ * and the open pass goes on. Into an image draws may have sampled: the
+ * frame's own, after the pass. Sega GT 2002 redefines a few textures a
+ * frame mid-scene, and each one split its 640x720 pass (a reload and a
+ * store of colour and depth).
+ */
+static VkCommandBuffer tex_cb(bool fresh)
+{
+    if (!fresh || g_tex_hoist_off) {
+        close_pass_why(PE_TEX);
+        return cb_get();
+    }
+    cb_get();                           /* the frame's pool, reset when it begins */
+    HleFrame *f = &g_back.fr[g_back.cur];
+    if (!f->ucb_open) {
+        VkCommandBufferBeginInfo bi = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+        T.vkBeginCommandBuffer(f->ucb, &bi);
+        f->ucb_open = true;
+    }
+    return f->ucb;
+}
+
+/* The frame's command buffers in submission order (its own ended): the
+ * upload one first when it has uploads. */
+static uint32_t frame_cbs(HleFrame *f, VkCommandBufferSubmitInfo cbi[2])
+{
+    uint32_t n = 0;
+    if (f->ucb_open) {
+        T.vkEndCommandBuffer(f->ucb);
+        f->ucb_open = false;
+        cbi[n++] = (VkCommandBufferSubmitInfo){
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = f->ucb };
+    }
+    cbi[n++] = (VkCommandBufferSubmitInfo){
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = f->cb };
+    return n;
+}
+
 static void submit(uint64_t value)
 {
+    hle_passlog_event("submit", 0, 0);
     if (g_pend.n && value >= g_pend.value) {
         g_pend.merged += g_pend.n;      /* this submit signals past them */
         g_pend.n = 0;
     }
     close_pass_why(PE_SUBMIT);
     HleFrame *f = &g_back.fr[g_back.cur];
-    VkCommandBufferSubmitInfo cbi = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = f->cb };
+    VkCommandBufferSubmitInfo cbi[2];
     VkSemaphoreSubmitInfo sig = {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = hle_tl_sem(),
         .value = value, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT };
     bool has_cb = g_back.recording;
+    uint32_t ncb = 0;
     if (has_cb) {
         gput_end(f->cb, g_back.cur);
         T.vkEndCommandBuffer(f->cb);
+        ncb = frame_cbs(f, cbi);
     }
     VkSubmitInfo2 si = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .commandBufferInfoCount = has_cb ? 1 : 0, .pCommandBufferInfos = &cbi,
+        .commandBufferInfoCount = ncb, .pCommandBufferInfos = cbi,
         .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig };
     hle_tl_gap_serve();
     int64_t ts = hle_prof_begin();
@@ -815,11 +964,10 @@ static void flush_idle(void)
         HleFrame *f = &g_back.fr[g_back.cur];
         gput_end(f->cb, g_back.cur);
         T.vkEndCommandBuffer(f->cb);
-        VkCommandBufferSubmitInfo cbi = {
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = f->cb };
+        VkCommandBufferSubmitInfo cbi[2];
         VkSubmitInfo2 si = {
             .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-            .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi };
+            .commandBufferInfoCount = frame_cbs(f, cbi), .pCommandBufferInfos = cbi };
         int64_t ts = hle_prof_begin();
         uint32_t pa = hle_hitch_enter(HLE_ACT_SUBMIT);
         hle_vk_queue_lock();
@@ -843,11 +991,12 @@ static void flush_idle(void)
     hle_vk_check(r, "vkQueueWaitIdle");
 }
 
-uint32_t g_hle_rscale = 1;
+uint32_t g_hle_rscale = 8;             /* eighths: 8 = 1x */
 
 static void cmd_device(const HleCmdDevice *c, bool reset)
 {
-    uint32_t scale = MIN(MAX(hle_host_render_scale(), 1), 4);
+    /* eighths, 0.5x .. 4x (host_native.c clamps the same way) */
+    uint32_t scale = MIN(MAX(hle_host_render_scale(), 4u), 32u);
     /* A Reset replaces only the device's surfaces (the front end destroys the
      * old ones by OBJ_DESTROY): the title's own render targets and textures
      * keep their images. A new scale resizes every image. */
@@ -864,8 +1013,8 @@ static void cmd_device(const HleCmdDevice *c, bool reset)
     g_back.disp_w = c->disp_w;
     g_back.disp_h = c->disp_h;
     g_back.present_id = c->present_id;
-    hle_disp_init(c->disp_w * scale, c->disp_h * scale);
-    hle_log("hakuX-hle-back", "DEVICE_%s %ux%u surfaces=%u present=%u scale=%u",
+    hle_disp_init(hle_rs_px(c->disp_w, scale), hle_rs_px(c->disp_h, scale));
+    hle_log("hakuX-hle-back", "DEVICE_%s %ux%u surfaces=%u present=%u scale=%u/8",
             reset ? "RESET" : "CREATE", c->disp_w, c->disp_h, c->nsurf, c->present_id,
             scale);
 }
@@ -1183,10 +1332,11 @@ static void pix_after(const HleCmdDraw *c)
     if (!g_pix.active || !g_pix.buf || !rtd_surf_ok(rt)) {
         return;
     }
-    /* the texel, and the pixel of the target's image */
-    uint32_t sc = rt->scale, gx = g_pix.host ? g_pix.x / sc : g_pix.x;
-    uint32_t gy = g_pix.host ? g_pix.y / sc : g_pix.y;
-    uint32_t px = g_pix.host ? g_pix.x : g_pix.x * sc, py = g_pix.host ? g_pix.y : g_pix.y * sc;
+    /* the texel, and the pixel of the target's image (scale in eighths) */
+    uint32_t sc = rt->scale, gx = g_pix.host ? g_pix.x * 8u / sc : g_pix.x;
+    uint32_t gy = g_pix.host ? g_pix.y * 8u / sc : g_pix.y;
+    uint32_t px = g_pix.host ? g_pix.x : g_pix.x * sc / 8u,
+             py = g_pix.host ? g_pix.y : g_pix.y * sc / 8u;
     if ((g_pix.id && g_back.rt != g_pix.id) || gx >= rt->d.w || gy >= rt->d.h) {
         return;
     }
@@ -1387,8 +1537,26 @@ static void cmd_set_rt(const HleCmdSetRt *c)
     rtd_note(c->rt);
     if (c->rt != g_back.rt || c->ds != g_back.ds) {
         close_pass_why(PE_SETRT);
+        if (g_pend.n) {
+            pend_flush();               /* held for this (pend_limit): the pass has ended */
+        }
         if (c->rt != g_back.rt) {
             rtd_snap(g_back.rt);
+        }
+        /* Targets left that draws have sampled before (an environment map,
+         * a shadow map) turn into textures now, between passes: when a draw
+         * of the next pass samples one, the pass no longer ends for it
+         * (hle_draw_tex_needs_prep). Sega GT 2002 split its 640x720 scene
+         * for that six times a frame. */
+        const uint32_t left[2] = { c->rt != g_back.rt ? g_back.rt : 0,
+                                   c->ds != g_back.ds ? g_back.ds : 0 };
+        for (unsigned i = 0; i < 2; i++) {
+            HleVkSurf *s = left[i] && !g_prep_early_off ? hle_surf_get(left[i]) : NULL;
+            if (s && s->sampled && !s->general && left[i] != c->rt && left[i] != c->ds &&
+                s->layout != VK_IMAGE_LAYOUT_UNDEFINED &&
+                s->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                hle_surf_transition(cb_get(), s, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            }
         }
         g_back.rt = c->rt;
         g_back.ds = c->ds;
@@ -1546,10 +1714,10 @@ static bool clear_masked(const HleCmdClear *c, HleVkSurf *rt, HleVkSurf *ds, uin
     for (uint32_t i = 0; i < MAX(c->nrects, 1u) && i < HLE_CMD_MAX_RECTS; i++) {
         VkRect2D r = { { 0, 0 }, { w, h } };
         if (c->nrects) {
-            int32_t x1 = MAX(c->rect[i].x1 * (int32_t)sc, 0);
-            int32_t y1 = MAX(c->rect[i].y1 * (int32_t)sc, 0);
-            int32_t x2 = MIN(c->rect[i].x2 * (int32_t)sc, (int32_t)w);
-            int32_t y2 = MIN(c->rect[i].y2 * (int32_t)sc, (int32_t)h);
+            int32_t x1 = MAX(c->rect[i].x1 * (int32_t)sc / 8, 0);
+            int32_t y1 = MAX(c->rect[i].y1 * (int32_t)sc / 8, 0);
+            int32_t x2 = MIN(c->rect[i].x2 * (int32_t)sc / 8, (int32_t)w);
+            int32_t y2 = MIN(c->rect[i].y2 * (int32_t)sc / 8, (int32_t)h);
             if (x2 <= x1 || y2 <= y1) {
                 continue;
             }
@@ -1654,9 +1822,10 @@ static void cmd_clear(const HleCmdClear *c)
         rects[nr++] = (VkClearRect){ { { 0, 0 }, { w, h } }, 0, 1 };
     }
     for (uint32_t i = 0; i < c->nrects && i < HLE_CMD_MAX_RECTS; i++) {
-        int32_t x1 = MAX(c->rect[i].x1 * sc, 0), y1 = MAX(c->rect[i].y1 * sc, 0);
-        int32_t x2 = MIN(c->rect[i].x2 * sc, (int32_t)w);
-        int32_t y2 = MIN(c->rect[i].y2 * sc, (int32_t)h);
+        /* sc is eighths: guest rectangles to image pixels */
+        int32_t x1 = MAX(c->rect[i].x1 * sc / 8, 0), y1 = MAX(c->rect[i].y1 * sc / 8, 0);
+        int32_t x2 = MIN(c->rect[i].x2 * sc / 8, (int32_t)w);
+        int32_t y2 = MIN(c->rect[i].y2 * sc / 8, (int32_t)h);
         if (x2 > x1 && y2 > y1) {
             rects[nr++] = (VkClearRect){ { { x1, y1 },
                                            { (uint32_t)(x2 - x1), (uint32_t)(y2 - y1) } },
@@ -1870,6 +2039,16 @@ static void cmd_swap(const HleCmdSwap *c)
     const uint64_t n = g_back.st.swaps + 1;     /* the swap that ends the frame */
     g_fh.armed = g_fh.hook.want && g_fh.hook.want(n, g_fh.hook.opaque);
     cmd_swap_present(c);
+    if (g_pl.on) {
+        g_pl.on = false;
+        hle_log("hakuX-hle-passlog", "frame end (%u passes)", g_pl.n);
+    }
+    if (g_pl.arm) {
+        g_pl.arm = false;
+        g_pl.on = true;
+        g_pl.n = 0;
+        hle_log("hakuX-hle-passlog", "frame begin (swap %llu)", (unsigned long long)n);
+    }
     if (dump) {
         rtd_write(c->value);
     }
@@ -1946,6 +2125,14 @@ static void back_props_poll(uint64_t swap)
         hle_log("hakuX-hle-back", "boundaries wait at most %lld us", (long long)(pend / 1000));
     }
     v[0] = 0;
+    hle_prop_get("debug.hakux.pendopenus", v);
+    const int64_t popen = v[0] ? atoi(v) * 1000ll : HLE_PEND_OPEN_NS;
+    if (popen != g_pend_open_ns) {
+        g_pend_open_ns = popen;
+        hle_log("hakuX-hle-back", "boundaries in an open pass wait at most %lld us",
+                (long long)(popen / 1000));
+    }
+    v[0] = 0;
     hle_prop_get("debug.hakux.visoff", v);
     if ((atoi(v) != 0) != g_vis_dbg.off) {
         g_vis_dbg.off = !g_vis_dbg.off;
@@ -1956,6 +2143,41 @@ static void back_props_poll(uint64_t swap)
     if (!strcmp(v, "0") != g_hle_fbbar_off) {
         g_hle_fbbar_off = !g_hle_fbbar_off;
         hle_log("hakuX-hle-back", "fb fetch barriers %s", g_hle_fbbar_off ? "off" : "on");
+    }
+    v[0] = 0;
+    hle_prop_get("debug.hakux.cmdbar", v);
+    if (!strcmp(v, "full") != g_cmdbar_full) {
+        g_cmdbar_full = !g_cmdbar_full;
+        hle_log("hakuX-hle-back", "command buffers start with %s barrier",
+                g_cmdbar_full ? "an all-commands" : "the fragment and transfer");
+    }
+    v[0] = 0;
+    hle_prop_get("debug.hakux.texnew", v);
+    if ((strcmp(v, "0") != 0) != g_hle_texnew) {
+        g_hle_texnew = !g_hle_texnew;
+        hle_log("hakuX-hle-back", "redefined textures: %s", g_hle_texnew ? "new images" :
+                "the same image while the size and format stay");
+    }
+    hle_thread_pin_poll();              /* debug.hakux.pin: which threads get the fast cores */
+    {
+        static HleProp passlog;
+        if (hle_prop_new(&passlog, "debug.hakux.passlog", v)) {
+            g_pl.arm = true;
+        }
+    }
+    v[0] = 0;
+    hle_prop_get("debug.hakux.texhoist", v);
+    if (!strcmp(v, "0") != g_tex_hoist_off) {
+        g_tex_hoist_off = !g_tex_hoist_off;
+        hle_log("hakuX-hle-back", "uploads into new images: %s", g_tex_hoist_off ?
+                "after the open pass" : "hoisted in front of the frame's commands");
+    }
+    v[0] = 0;
+    hle_prop_get("debug.hakux.prepearly", v);
+    if (!strcmp(v, "0") != g_prep_early_off) {
+        g_prep_early_off = !g_prep_early_off;
+        hle_log("hakuX-hle-back", "sampled targets turn into textures %s",
+                g_prep_early_off ? "when sampled" : "when left");
     }
     v[0] = 0;
     hle_prop_get("debug.hakux.gpucut", v);
@@ -1989,8 +2211,8 @@ static void cmd_swap_present(const HleCmdSwap *c)
         uint32_t dw, dh;
         hle_disp_size(&dw, &dh);
         /* the part of src shown (HleCmdSwap.src_w / src_h), in its pixels */
-        const uint32_t sw = c->src_w ? MIN(src->w, c->src_w * src->scale) : src->w;
-        const uint32_t sh = c->src_h ? MIN(src->h, c->src_h * src->scale) : src->h;
+        const uint32_t sw = c->src_w ? MIN(src->w, hle_rs_px(c->src_w, src->scale)) : src->w;
+        const uint32_t sh = c->src_h ? MIN(src->h, hle_rs_px(c->src_h, src->scale)) : src->h;
         if (!g_gamma.identity && !g_gamma.off && !hle_disp_gamma_consumer() &&
             hle_gamma_pass(cb, g_back.cur, g_gamma.rgb, src, sw, sh, dst, dw, dh)) {
             overlay_blit(cb, dst, dw, dh);
@@ -2046,7 +2268,7 @@ static bool readback_packed(const HleCmdReadback *c, VkBuffer buf, VkDeviceSize 
     hle_surf_transition(cb, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     VkImage img = o->img;
     VkImageLayout il = o->general ? VK_IMAGE_LAYOUT_GENERAL : o->layout;
-    if (o->scale > 1) {                         /* the guest gets guest-size texels */
+    if (o->scale != 8u) {                       /* the guest gets guest-size texels */
         img = hle_surf_down(cb, o, il, level, layer, c->w, c->h);
         if (!img) {
             return false;
@@ -2116,7 +2338,7 @@ static void cmd_readback(const HleCmdReadback *c)
         hle_surf_transition(cb, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         VkImage img = s->img;
         VkImageLayout il = s->layout;
-        if (s->scale > 1 || w != s->d.w || h != s->d.h) {
+        if (s->scale != 8u || w != s->d.w || h != s->d.h) {
             /* the guest gets guest-size pixels (or the size asked for:
              * a multisampled display persisted at display size) */
             img = hle_surf_down(cb, s, il, 0, 0, w, h);
@@ -2211,27 +2433,28 @@ static void cmd_copy(const HleCmdCopy *c)
         g_back.st.copies++;
         return;
     }
-    int32_t k = (int32_t)s->scale, kd = (int32_t)d->scale;
+    int32_t k = (int32_t)s->scale, kd = (int32_t)d->scale;   /* eighths */
     uint32_t n = 0;
     for (uint32_t i = 0; i < c->nrects && i < HLE_CMD_MAX_RECTS; i++) {
         const HleRect *r = &c->rect[i];
-        int32_t w = MIN(MIN(r->x2, (int32_t)s->w / k) - r->x1, (int32_t)d->w / kd - c->x[i]);
-        int32_t h = MIN(MIN(r->y2, (int32_t)s->h / k) - r->y1, (int32_t)d->h / kd - c->y[i]);
+        int32_t w = MIN(MIN(r->x2, (int32_t)s->w * 8 / k) - r->x1, (int32_t)d->w * 8 / kd - c->x[i]);
+        int32_t h = MIN(MIN(r->y2, (int32_t)s->h * 8 / k) - r->y1, (int32_t)d->h * 8 / kd - c->y[i]);
         if (r->x1 < 0 || r->y1 < 0 || c->x[i] < 0 || c->y[i] < 0 || w <= 0 || h <= 0) {
             continue;
         }
         cr[n] = (VkImageCopy2){
             .sType = VK_STRUCTURE_TYPE_IMAGE_COPY_2,
-            .srcSubresource = ss, .srcOffset = { r->x1 * k, r->y1 * k, 0 },
-            .dstSubresource = ds, .dstOffset = { c->x[i] * k, c->y[i] * k, 0 },
-            .extent = { (uint32_t)(w * k), (uint32_t)(h * k), 1 } };
+            .srcSubresource = ss, .srcOffset = { r->x1 * k / 8, r->y1 * k / 8, 0 },
+            .dstSubresource = ds, .dstOffset = { c->x[i] * k / 8, c->y[i] * k / 8, 0 },
+            .extent = { (uint32_t)(w * k / 8), (uint32_t)(h * k / 8), 1 } };
         br[n] = (VkImageBlit2){
             .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
             .srcSubresource = ss,
-            .srcOffsets = { { r->x1 * k, r->y1 * k, 0 }, { (r->x1 + w) * k, (r->y1 + h) * k, 1 } },
+            .srcOffsets = { { r->x1 * k / 8, r->y1 * k / 8, 0 },
+                            { (r->x1 + w) * k / 8, (r->y1 + h) * k / 8, 1 } },
             .dstSubresource = ds,
-            .dstOffsets = { { c->x[i] * kd, c->y[i] * kd, 0 },
-                            { (c->x[i] + w) * kd, (c->y[i] + h) * kd, 1 } } };
+            .dstOffsets = { { c->x[i] * kd / 8, c->y[i] * kd / 8, 0 },
+                            { (c->x[i] + w) * kd / 8, (c->y[i] + h) * kd / 8, 1 } } };
         n++;
     }
     if (!n) {
@@ -2268,17 +2491,42 @@ static void cmd_upload(const HleCmdUpload *c)
 {
     close_pass();
     HleVkSurf *d = hle_surf_get(c->dst);
+    /* A level or face of a texture target (a view: d.parent) is written
+     * in its owner's image, at its level and layer */
+    HleVkSurf *o = d && d->d.parent ? hle_surf_get(d->d.parent) : d;
     const char *why = !d ? "no surface" : !g_hram.zero_copy && !c->arena ? "guest RAM not mapped" :
-                      d->d.parent ? "a level or face" : !hle_surf_ensure(d) ? "no image" :
+                      !o ? "no owner" : !hle_surf_ensure(d) || !hle_surf_ensure(o) ? "no image" :
                       !(d->aspect & VK_IMAGE_ASPECT_COLOR_BIT) ? "not colour" :
                       !d->texel_bytes || c->pitch % d->texel_bytes ? "pitch" : NULL;
-    int32_t k = d ? (int32_t)MAX(d->scale, 1u) : 1, n = 0;
+    const uint32_t level = d && d->d.parent ? d->d.level : 0;
+    const uint32_t layer = d && d->d.parent ? d->d.face : 0;
+    int32_t k = d ? (int32_t)MAX(d->scale, 4u) : 8;      /* eighths */
+    uint32_t n = 0;
     VkCommandBuffer cb = why ? VK_NULL_HANDLE : cb_get();
     for (uint32_t i = 0; !why && i < c->nrects && i < HLE_CMD_MAX_RECTS; i++) {
         const HleRect *r = &c->rect[i];
-        int32_t w = MIN(r->x2 - r->x1, (int32_t)d->w / k - c->x[i]);
-        int32_t h = MIN(r->y2 - r->y1, (int32_t)d->h / k - c->y[i]);
+        int32_t w = MIN(r->x2 - r->x1, (int32_t)d->w * 8 / k - c->x[i]);
+        int32_t h = MIN(r->y2 - r->y1, (int32_t)d->h * 8 / k - c->y[i]);
         if (r->x1 < 0 || r->y1 < 0 || c->x[i] < 0 || c->y[i] < 0 || w <= 0 || h <= 0) {
+            continue;
+        }
+        /* the rows in guest RAM, or their copy in the arena (from lo) */
+        const uint32_t at = c->pa + (uint32_t)r->y1 * c->pitch + (uint32_t)r->x1 * d->texel_bytes;
+        if (k == 8) {
+            /* At its own size: straight into the surface, no scratch image
+             * or blit (which the format may not have: Sega GT 2002's
+             * R5G6B5 cube faces kept their clear, and its cars reflected
+             * white). */
+            hle_surf_transition(cb, d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkBufferImageCopy dc = {
+                .bufferOffset = c->arena ? (VkDeviceSize)(c->arena - 1) + (at - c->lo) : at,
+                .bufferRowLength = c->pitch / d->texel_bytes,
+                .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 },
+                .imageOffset = { c->x[i], c->y[i], 0 },
+                .imageExtent = { (uint32_t)w, (uint32_t)h, 1 } };
+            T.vkCmdCopyBufferToImage(cb, c->arena ? g_harena.buf : g_hram.buf, o->img,
+                                     d->layout, 1, &dc);
+            n++;
             continue;
         }
         VkImage tmp = hle_surf_scratch(d->fmt, (uint32_t)w, (uint32_t)h);
@@ -2288,8 +2536,6 @@ static void cmd_upload(const HleCmdUpload *c)
         }
         hle_img_barrier(cb, tmp, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        /* the rows in guest RAM, or their copy in the arena (from lo) */
-        const uint32_t at = c->pa + (uint32_t)r->y1 * c->pitch + (uint32_t)r->x1 * d->texel_bytes;
         VkBufferImageCopy bc = {
             .bufferOffset = c->arena ? (VkDeviceSize)(c->arena - 1) + (at - c->lo) : at,
             .bufferRowLength = c->pitch / d->texel_bytes,
@@ -2305,13 +2551,13 @@ static void cmd_upload(const HleCmdUpload *c)
             .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
             .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .srcOffsets = { { 0, 0, 0 }, { w, h, 1 } },
-            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .dstOffsets = { { c->x[i] * k, c->y[i] * k, 0 },
-                            { (c->x[i] + w) * k, (c->y[i] + h) * k, 1 } } };
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1 },
+            .dstOffsets = { { c->x[i] * k / 8, c->y[i] * k / 8, 0 },
+                            { (c->x[i] + w) * k / 8, (c->y[i] + h) * k / 8, 1 } } };
         VkBlitImageInfo2 bi = {
             .sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
             .srcImage = tmp, .srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            .dstImage = d->img, .dstImageLayout = d->layout,
+            .dstImage = o->img, .dstImageLayout = d->layout,
             .regionCount = 1, .pRegions = &br, .filter = VK_FILTER_NEAREST };
         T.vkCmdBlitImage2(cb, &bi);
         n++;
@@ -2418,6 +2664,7 @@ uint64_t hle_back_submits(void)
 static void dispatch(const HleCmdHdr *h)
 {
     const void *p = hle_cmd_payload(h);
+    g_pl.in_draw = false;               /* the draw case sets it (pass log) */
     switch (h->op) {
     case HLE_OP_STATE: case HLE_OP_STATE_PART: case HLE_OP_VIEWPORT: case HLE_OP_VSH:
     case HLE_OP_OBJ_CREATE: case HLE_OP_KICK: case HLE_OP_DRAW:
@@ -2462,15 +2709,15 @@ static void dispatch(const HleCmdHdr *h)
             close_pass();       /* debug (debug.hakux.kick=3): the pass split alone */
         }
         break;
-    case HLE_OP_READBACK: cmd_readback(p); break;
-    case HLE_OP_UPLOAD:   cmd_upload(p); break;
+    case HLE_OP_READBACK: hle_passlog_event("readback", 0, 0); cmd_readback(p); break;
+    case HLE_OP_UPLOAD:   hle_passlog_event("upload", 0, 0); cmd_upload(p); break;
     case HLE_OP_STATE:    hle_draw_cmd_state(p); break;
     case HLE_OP_STATE_PART: hle_draw_cmd_state_part(p); break;
     case HLE_OP_GAMMA:    cmd_gamma(p); break;
     case HLE_OP_OVERLAY:  cmd_overlay(p); break;
-    case HLE_OP_COPY:     cmd_copy(p); break;
-    case HLE_OP_ZREAD:    cmd_zread(p); break;
-    case HLE_OP_ZWRITE:   cmd_zwrite(p); break;
+    case HLE_OP_COPY:     hle_passlog_event("copy", 0, 0); cmd_copy(p); break;
+    case HLE_OP_ZREAD:    hle_passlog_event("zread", 0, 0); cmd_zread(p); break;
+    case HLE_OP_ZWRITE:   hle_passlog_event("zwrite", 0, 0); cmd_zwrite(p); break;
     case HLE_OP_VSH:      hle_draw_cmd_vsh(p); break;
     case HLE_OP_VIS_BEGIN:
         g_vis.active = true;
@@ -2479,10 +2726,12 @@ static void dispatch(const HleCmdHdr *h)
         break;
     case HLE_OP_VIS_END:  cmd_vis_end(p); break;
     case HLE_OP_TEX:
-        close_pass_why(PE_TEX);                 /* uploads never split a pass (P3 Task 9 hoists) */
-        hle_draw_cmd_tex(p, cb_get());
+        hle_passlog_event("texture", ((const HleCmdTex *)p)->id, g_back.pass_open);
+        hle_draw_cmd_tex(p, tex_cb);            /* into a new image: hoisted, the pass goes on */
         break;
     case HLE_OP_DRAW: {
+        g_pl.draws += g_pl.on;
+        g_pl.in_draw = g_pl.on;
         /* a draw reading the target it renders: the pass renders in
          * RENDERING_LOCAL_READ (reopened once when it was not) */
         unsigned fb = hle_draw_fb_stages(p, g_back.rt);
@@ -2594,6 +2843,7 @@ static void *render_thread(void *opaque)
 {
     HleRing *r = hle_fe_ring();
     hle_hitch_thread(HLE_HT_RENDER);
+    hle_thread_role(HLE_PIN_RENDER);
     for (;;) {
         hle_event_reset(&g_back.kick);
         const HleCmdHdr *h;
@@ -2694,6 +2944,7 @@ int hle_back_start(void)
             .commandPool = g_back.fr[i].pool,
             .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
         T.vkAllocateCommandBuffers(g_hvk.dev, &ai, &g_back.fr[i].cb);
+        T.vkAllocateCommandBuffers(g_hvk.dev, &ai, &g_back.fr[i].ucb);
     }
     hle_event_init(&g_back.kick, false);
     hle_barrier_set_waiter(hle_tl_completed, hle_tl_wait);

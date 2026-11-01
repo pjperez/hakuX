@@ -20,12 +20,17 @@ VkResult hle_tl_sem_wait(VkSemaphore sem, uint64_t value, uint64_t timeout_ns);
  * (hle_tl_gap, back.h). */
 void hle_tl_gap_serve(void);
 
-/* Resolution scale (the surface_scale setting, 1-4, read at DEVICE_CREATE):
- * every render target and depth surface is rendered at d.w * scale by
- * d.h * scale. Guest-facing values stay in guest pixels (D3D viewports,
+/* Resolution scale (the surface_scale setting, 0.5-4, read at DEVICE_CREATE),
+ * held in eighths of a guest pixel: 4 = 0.5x, 8 = 1x, 16 = 2x ... 32 = 4x.
+ * Every render target and depth surface is rendered at d.w * scale / 8 by
+ * d.h * scale / 8. Guest-facing values stay in guest pixels (D3D viewports,
  * clear rects, readbacks, visibility counts) and are converted where the
- * image is used. */
+ * image is used (hle_rs_px: the two axes share the denominator). */
 extern uint32_t g_hle_rscale;
+static inline uint32_t hle_rs_px(uint32_t guest, uint32_t e8)
+{
+    return guest * e8 / 8u;
+}
 
 /* surf.c */
 typedef struct HleVkSurf {
@@ -33,7 +38,7 @@ typedef struct HleVkSurf {
     uint32_t id;
     HleSurfDesc d;
     uint32_t w, h;              /* image extent (views: their level's), scaled */
-    uint32_t scale;             /* host pixels per guest pixel (hle_surf_define) */
+    uint32_t scale;             /* host pixels per guest pixel, in eighths (hle_surf_define) */
     VkFormat fmt;
     VkImageAspectFlags aspect;
     uint32_t texel_bytes;
@@ -52,6 +57,10 @@ typedef struct HleVkSurf {
     /* a draw read it as an input attachment (vk/draw.c hle_draw_fb_stages):
      * passes on it render in RENDERING_LOCAL_READ from then on */
     bool local_read;
+    /* a draw sampled it (vk/draw.c hle_draw_tex_prep): it goes to
+     * SHADER_READ_ONLY when a pass on it ends for another target (back.c
+     * cmd_set_rt), not when the draw that samples it comes */
+    bool sampled;
     uint32_t nlevels, nfaces;   /* owners: the image's levels and layers */
     uint64_t dirty;            /* owners: subresources rendered since the last read barrier */
     uint32_t rendered_levels;   /* owners: levels 0..n-1 sampled (the highest rendered + 1) */
@@ -143,7 +152,9 @@ int hle_draw_init(void);
 void hle_draw_prebuild(void);
 void hle_draw_cmd_state(const HleCmdState *s);
 void hle_draw_cmd_state_part(const HleCmdStatePart *p);
-void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer cb);
+/* get_cb(fresh): the command buffer for its upload, fresh when it goes into a new
+ * image (back.c tex_cb) */
+void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer (*get_cb)(bool fresh));
 void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id,
                        uint32_t ds_id, const HleCmdViewport *vp);
 /* A recording starts (back.c cb_get, outside any pass). */
@@ -187,6 +198,12 @@ extern unsigned g_hle_zeq;
 void hle_draw_fb_bind(VkCommandBuffer cb, HleVkSurf *rt, HleVkSurf *ds, VkImageView zv,
                       bool zbar);
 extern bool g_hle_fbbar_off;            /* debug (debug.hakux.fbbar=0): no barrier */
+/* debug.hakux.passlog (back.c): a render target sampled by the pass logged now, and
+ * other work between passes */
+void hle_passlog_sampled(uint32_t surf);
+void hle_passlog_event(const char *what, uint32_t a, uint32_t b);
+extern bool g_hle_texnew;               /* debug (debug.hakux.texnew=0: off): redefined textures
+                                           get new images (hle_draw_cmd_tex) */
 /* debug (debug.hakux.gpucut): 1 (frag) draws scissored to one pixel, 2 (draw)
  * the state recorded and no draw, 3 (pass) neither: the passes alone, 4 (tri)
  * draws of 3 vertices scissored to one pixel */

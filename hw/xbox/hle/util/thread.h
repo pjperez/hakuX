@@ -90,6 +90,21 @@ void hle_event_wait(HleEvent *e);
 void hle_thread_create(HleThread *t, const char *name, void *(*fn)(void *), void *arg, int mode);
 void *hle_thread_join(HleThread *t);
 
+/*
+ * Placement of the threads every frame waits on, on a CPU whose cores
+ * differ (Linux cpu_capacity): the calling thread registers its role, and
+ * the placement follows debug.hakux.pin on Android (hle_thread_pin_poll,
+ * live): 0 anywhere; 1 (default) render and decoder on the fastest cores,
+ * the vCPU anywhere; 2 vCPU and render fast, decoder on the others;
+ * 3 vCPU and decoder fast, render on the others. Modes 1 to 3 keep the
+ * audio threads (the APU's frame and voice workers, ~0.9 of a core in Sega
+ * GT 2002) on the others too.
+ */
+enum { HLE_PIN_VCPU, HLE_PIN_RENDER, HLE_PIN_DECODE, HLE_PIN_AUDIO, HLE_PIN_N };
+void hle_thread_role(int role);
+void hle_thread_role_tid(int role, int tid);   /* another thread's */
+void hle_thread_pin_poll(void);
+
 /* The monotonic clock. */
 static inline int64_t hle_now_ns(void)
 {

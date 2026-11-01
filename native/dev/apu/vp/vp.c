@@ -2148,6 +2148,12 @@ static void voice_work_share(MCPXAPUState *d, VoiceWorker *self)
         for (int i = 0; i < self->queue_len; i++) {
             voice_process(d, c, self->mixbins, self->sample_buf,
                           self->queue[i].voice, self->queue[i].list);
+            /* The voice is done for the frame: its spinlock goes now, not
+             * with the batch's (voice_take; the next frame takes it again).
+             * The guest's register writes wait on it (voice_spin_lock): held
+             * for the whole batch, they were a tenth of the vCPU thread in
+             * Sega GT 2002 with the voices on the little cores. */
+            apu_spin_unlock(&d->vp.voice_spinlocks[self->queue[i].voice]);
         }
     }
 
@@ -2225,7 +2231,7 @@ static void *voice_worker_thread(void *arg)
 uint32_t g_vp_held_skips, g_vp_held_waits, g_vp_held_wait_max_us, g_vp_held_run_max;
 
 typedef enum VoiceTake {
-    VOICE_TAKEN,    /* active: its spinlock kept for the batch */
+    VOICE_TAKEN,    /* active: its spinlock kept until its share processed it */
     VOICE_IDLE,     /* off: for the idle report */
     VOICE_HELD,     /* the guest's: a later frame's */
 } VoiceTake;
@@ -2297,15 +2303,6 @@ static void voice_work_enqueue(MCPXAPUState *d, int v, int list)
         .voice = v,
         .list = list,
     };
-}
-
-static void voice_work_release_voice_locks(MCPXAPUState *d)
-{
-    VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
-
-    for (int i = 0; i < vwd->queue_len; i++) {
-        apu_spin_unlock(&d->vp.voice_spinlocks[vwd->queue[i].voice]);
-    }
 }
 
 /* Fewer voices than this a frame: all the frame thread's, no helper woken
@@ -2392,7 +2389,7 @@ voice_work_dispatch(MCPXAPUState *d, uint8_t *c,
         while (vwd->workers_pending) {  /* a spurious wake-up: workers still running */
             pthread_cond_wait(&vwd->work_finished, &vwd->lock);
         }
-        voice_work_release_voice_locks(d);
+        /* each share released its voices' spinlocks (voice_work_share) */
         vwd->queue_len = 0;
 
         // Add voice contributions (none to the mixbins in the VP's own mix)

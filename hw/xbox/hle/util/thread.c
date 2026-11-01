@@ -1,11 +1,21 @@
 /*
  * hakuX HLE GPU — threads, events and timers over pthreads (thread.h).
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE             /* sched_setaffinity */
+#endif
 #include "hw/xbox/hle/util/thread.h"
 
 #include <errno.h>
+#include <sched.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
+
+#ifdef __ANDROID__
+#include "hw/xbox/hle/prop.h"
+#endif
 
 static void monotonic_cond_init(pthread_cond_t *c)
 {
@@ -217,4 +227,138 @@ void hle_timer_mod(HleTimer *t, int64_t deadline_ms)
     t->deadline_ms = deadline_ms;
     pthread_cond_broadcast(&g_tc);
     pthread_mutex_unlock(&g_tm);
+}
+
+void hle_log(const char *tag, const char *fmt, ...);
+
+#ifdef __linux__
+static struct {
+    int tid[HLE_PIN_N][8];          /* the role's threads (audio: several) */
+    int ntid[HLE_PIN_N];
+    int mode;                       /* applied; -1 none yet */
+    bool probed, mixed;
+    cpu_set_t fast, slow, all;
+    int nfast, ncpu;
+} g_pin = { .mode = -1 };
+
+/* The fastest cores (the highest cpu_capacity) and the others. */
+static void pin_probe(void)
+{
+    g_pin.probed = true;
+    int cap[64], best = 0, n = 0;
+    for (int c = 0; c < 64; c++) {
+        char path[96];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpu_capacity", c);
+        FILE *f = fopen(path, "r");
+        if (!f) {
+            break;
+        }
+        if (fscanf(f, "%d", &cap[c]) != 1) {
+            cap[c] = 0;
+        }
+        fclose(f);
+        best = cap[c] > best ? cap[c] : best;
+        n = c + 1;
+    }
+    CPU_ZERO(&g_pin.fast);
+    CPU_ZERO(&g_pin.slow);
+    CPU_ZERO(&g_pin.all);
+    for (int c = 0; c < n; c++) {
+        CPU_SET(c, &g_pin.all);
+        if (cap[c] == best) {
+            CPU_SET(c, &g_pin.fast);
+            g_pin.nfast++;
+        } else {
+            CPU_SET(c, &g_pin.slow);
+        }
+    }
+    g_pin.ncpu = n;
+    g_pin.mixed = best && g_pin.nfast < n;
+}
+
+static int pin_mode(void)
+{
+#ifdef __ANDROID__
+    char v[PROP_VALUE_MAX];
+    if (hle_prop_get("debug.hakux.pin", v) && v[0] >= '0' && v[0] <= '3' && !v[1]) {
+        return v[0] - '0';
+    }
+#endif
+    return 1;
+}
+
+/* Role r's cores in mode m. */
+static const cpu_set_t *pin_set(int m, int r)
+{
+    /* A anywhere, F the fastest cores, S the others. The vCPU kept off the
+     * fastest cores (an earlier mode 1) made Sega GT 2002 guest-bound: 33
+     * fps against 43 with it anywhere. */
+    enum { A, F, S };
+    static const uint8_t where[4][HLE_PIN_N] = {
+        /* vcpu render decode audio */
+        { A, A, A, A },
+        { A, F, F, S },
+        { F, F, S, S },
+        { F, S, F, S },
+    };
+    const uint8_t w = where[m][r];
+    return w == F ? &g_pin.fast : w == S ? &g_pin.slow : &g_pin.all;
+}
+
+static void pin_apply(int m)
+{
+    for (int r = 0; r < HLE_PIN_N; r++) {
+        for (int i = 0; i < __atomic_load_n(&g_pin.ntid[r], __ATOMIC_ACQUIRE); i++) {
+            sched_setaffinity(g_pin.tid[r][i], sizeof(cpu_set_t), pin_set(m, r));
+        }
+    }
+}
+#endif
+
+void hle_thread_role_tid(int role, int tid)
+{
+#ifdef __linux__
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, pin_probe);
+    const int i = __atomic_load_n(&g_pin.ntid[role], __ATOMIC_RELAXED);
+    if (i < 8) {
+        g_pin.tid[role][i] = tid;
+        __atomic_store_n(&g_pin.ntid[role], i + 1, __ATOMIC_RELEASE);
+    }
+    if (g_pin.mixed) {
+        sched_setaffinity(tid, sizeof(cpu_set_t), pin_set(pin_mode(), role));
+    }
+#else
+    (void)role;
+    (void)tid;
+#endif
+}
+
+void hle_thread_role(int role)
+{
+#ifdef __linux__
+    hle_thread_role_tid(role, (int)gettid());
+#else
+    (void)role;
+#endif
+}
+
+void hle_thread_pin_poll(void)
+{
+#ifdef __linux__
+    if (!g_pin.probed || !g_pin.mixed) {
+        return;
+    }
+    int m = pin_mode();
+    if (m != g_pin.mode) {
+        g_pin.mode = m;
+        pin_apply(m);
+        static const char *const names[4] = {
+            "anywhere", "render and decoder on the fastest cores, the vCPU anywhere",
+            "vCPU and render on the fastest cores", "vCPU and decoder on the fastest cores" };
+        /* modes 1-3 also keep the audio threads on the other cores */
+        hle_log("hakuX-hle", "threads: %s (%d of %d cores fast; debug.hakux.pin=%d)", names[m],
+                g_pin.nfast, g_pin.ncpu, m);
+    }
+#endif
 }

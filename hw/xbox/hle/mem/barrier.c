@@ -7,6 +7,8 @@
 #include "hw/xbox/hle/mem/barrier.h"
 #include "hw/xbox/hle/mem/guestmem.h"
 #include "hw/xbox/hle/mem/pageuse.h"
+#include "hw/xbox/hle/host.h"
+#include "hw/xbox/hle/prop.h"
 
 #include <sched.h>
 
@@ -626,7 +628,17 @@ void hle_barrier_guard_stats(uint64_t *neighbours, uint64_t *hot)
  * 60; ~0.7 s a second waited). */
 #define RPT_PAGES   8
 #define RPT_PENDING 256
-#define RPT_WAIT_NS 30000000ll
+/* How long a read waits for reports none of whose tests has a result yet:
+ * then they are given up. Reports whose tests all have one are settled with
+ * it at once (rpt_settle), as Dolphin and PCSX2 serve late occlusion
+ * results. The gate waited 30 ms for every read and settled nothing: in
+ * Sega GT 2002's races ~1 read in 12 waited it out (a dropped frame each)
+ * and 9 in 10 found the decoder held short of them; ~8% of the guest's
+ * thread waited, for reads that got no result. Waiting up to 6 ms and then
+ * settling, ~13% waited (the title read 2.5x as often); settled at once,
+ * ~0%. debug.hakux.rptwait=<ms>: live, the wait for the rest. */
+#define RPT_WAIT_MS 6
+#define RPT_LAST    64
 static struct {
     uint32_t page[RPT_PAGES];           /* pa >> 12 */
     bool shut[RPT_PAGES];               /* without guest access */
@@ -637,7 +649,8 @@ static struct {
         bool decoded;                   /* the decoder reached it */
     } e[RPT_PENDING];
     uint32_t seq;
-    uint64_t waits, ns, timeouts, held, lost;
+    uint64_t waits, ns, timeouts, held, lost, settled;
+    struct { uint32_t pa, count; } last[RPT_LAST];  /* each report's last result, by pa */
 } g_rpt;
 static int g_rpt_lock;
 static uint32_t (*g_rpt_scout)(void);
@@ -733,9 +746,20 @@ void hle_barrier_report_decoded(uint32_t pa)
     rpt_unlock();
 }
 
+static unsigned rpt_last_slot(uint32_t pa)
+{
+    return (pa >> 4) % RPT_LAST;
+}
+
 void hle_barrier_report_written(uint32_t pa)
 {
+    const uint8_t *r = hle_pa_ptr(pa, 16);
     rpt_lock();
+    if (r) {                            /* the test's result, for rpt_settle */
+        const unsigned i = rpt_last_slot(pa);
+        g_rpt.last[i].pa = pa;
+        g_rpt.last[i].count = hle_ldl_le(r + 8);
+    }
     int best = -1;                      /* the oldest of its pushes */
     for (unsigned k = 0; k < RPT_PENDING; k++) {
         if (g_rpt.e[k].seq && g_rpt.e[k].pa == pa &&
@@ -766,6 +790,65 @@ static bool rpt_late(unsigned pg, uint32_t frame, bool *ahead)
         }
     }
     return late;
+}
+
+/* The reports of page pg from frames before `frame` (rpt_lock held), given
+ * up: one still pending in guest memory (status not 0) gets its test's last
+ * result, as the GPU's would be a frame on (Dolphin and PCSX2 serve late
+ * occlusion results so). Left pending, the title polled it, its thread
+ * spinning until the back end wrote it. Not waited for again either way. */
+static void rpt_settle(unsigned pg, uint32_t frame)
+{
+    for (unsigned k = 0; k < RPT_PENDING; k++) {
+        if (!g_rpt.e[k].seq || g_rpt.e[k].pa >> 12 != g_rpt.page[pg] ||
+            (int32_t)(g_rpt.e[k].frame - frame) >= 0) {
+            continue;
+        }
+        const uint32_t pa = g_rpt.e[k].pa;
+        const unsigned i = rpt_last_slot(pa);
+        uint8_t *r = hle_pa_ptr(pa, 16);
+        if (r && g_rpt.last[i].pa == pa && hle_ldl_le(r + 12)) {
+            const uint64_t ts = (uint64_t)hle_now_ns();
+            memcpy(r, &ts, 8);
+            hle_stl_le(r + 8, g_rpt.last[i].count);
+            hle_smp_wmb();
+            hle_stl_le(r + 12, 0);
+            hle_host_mem_set_dirty(pa, 16);
+            g_rpt.settled++;
+        }
+        g_rpt.e[k].seq = 0;
+    }
+}
+
+static int64_t rpt_wait_ns(void)
+{
+    static int64_t ns = RPT_WAIT_MS * 1000000ll, polled;
+#ifdef __ANDROID__
+    const int64_t now = hle_now_ns();
+    if (now - polled >= 1000000000) {
+        polled = now;
+        char v[PROP_VALUE_MAX];
+        hle_prop_get("debug.hakux.rptwait", v);
+        ns = (v[0] ? atoi(v) : RPT_WAIT_MS) * 1000000ll;
+    }
+#else
+    (void)polled;
+#endif
+    return ns;
+}
+
+/* Whether every report of page pg from frames before `frame` (rpt_lock
+ * held) has its test's last result to be settled with. */
+static bool rpt_settleable(unsigned pg, uint32_t frame)
+{
+    for (unsigned k = 0; k < RPT_PENDING; k++) {
+        if (g_rpt.e[k].seq && g_rpt.e[k].pa >> 12 == g_rpt.page[pg] &&
+            (int32_t)(g_rpt.e[k].frame - frame) < 0 &&
+            g_rpt.last[rpt_last_slot(g_rpt.e[k].pa)].pa != g_rpt.e[k].pa) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* The guest's access to a report page (its thread): true if it was one. */
@@ -799,25 +882,24 @@ static bool rpt_access(uint32_t pa)
          * a test soon after it (pbdraw.c) */
         __atomic_store_n(&g_rpt_waiting, 1, __ATOMIC_RELEASE);
         bool (*held)(void) = __atomic_load_n(&g_rpt_held, __ATOMIC_ACQUIRE);
+        const int64_t wait_ns = rpt_wait_ns();
         for (;;) {
             rpt_lock();
             late = rpt_late((unsigned)pg, frame, &ahead);
             /* the decoder short of a report and waiting on this thread */
             const bool stuck = late && ahead && held && held();
-            if (late && (stuck || hle_now_ns() - t0 > RPT_WAIT_NS)) {
-                /* the back end won't write them now (stuck), or at all (a
-                 * test the decoder dropped): not waited for again */
-                for (unsigned k = 0; k < RPT_PENDING; k++) {
-                    if (g_rpt.e[k].seq && g_rpt.e[k].pa >> 12 == g_rpt.page[pg] &&
-                        (int32_t)(g_rpt.e[k].frame - frame) < 0) {
-                        g_rpt.e[k].seq = 0;
-                    }
-                }
+            const bool now = late && rpt_settleable((unsigned)pg, frame);
+            if (late && (stuck || now || hle_now_ns() - t0 > wait_ns)) {
+                /* the back end won't write them now (stuck), in time, or at
+                 * all (a test the decoder dropped): settled */
+                rpt_settle((unsigned)pg, frame);
                 if (stuck) {
                     g_rpt.held++;
+                } else if (now) {
+                    /* settled: not a wait given up */
                 } else if (g_rpt.timeouts++ < 8) {
-                    hle_log("hakuX-hle-pb", "report gate: page %08x's reports not written in 30 ms",
-                            g_rpt.page[pg] << 12);
+                    hle_log("hakuX-hle-pb", "report gate: page %08x's reports not written in %lld ms",
+                            g_rpt.page[pg] << 12, (long long)(wait_ns / 1000000));
                 }
                 late = false;
             }
@@ -856,8 +938,10 @@ static bool rpt_page_shut(uint32_t pa)
     return shut;
 }
 
-void hle_barrier_report_stats(uint64_t *waits, uint64_t *ns, uint64_t *timeouts, uint64_t *held)
+void hle_barrier_report_stats(uint64_t *waits, uint64_t *ns, uint64_t *timeouts, uint64_t *held,
+                              uint64_t *settled)
 {
+    *settled = g_rpt.settled;
     *waits = g_rpt.waits;
     *ns = g_rpt.ns;
     *timeouts = g_rpt.timeouts;

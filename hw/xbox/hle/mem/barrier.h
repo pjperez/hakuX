@@ -136,7 +136,8 @@ void hle_barrier_report_written(uint32_t pa);
 void hle_barrier_set_report_scout(uint32_t (*scout)(void), bool (*held)(void));
 /* The gate's counts: accesses that waited, their time, waits given up after
  * 30 ms, and at once (the decoder held by the guest short of the report). */
-void hle_barrier_report_stats(uint64_t *waits, uint64_t *ns, uint64_t *timeouts, uint64_t *held);
+void hle_barrier_report_stats(uint64_t *waits, uint64_t *ns, uint64_t *timeouts, uint64_t *held,
+                              uint64_t *settled);
 /* The host, at the guest's first store to a page tracking made clean
  * (host.h hle_host_mem_test_and_clear). */
 void hle_mem_first_write(uint64_t ram_addr, unsigned size);

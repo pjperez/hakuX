@@ -149,16 +149,31 @@ const char *hle_host_base_path(void)
     return path;
 }
 
-static int g_render_scale = 1;
+/* Render scale in eighths of a guest pixel: 4 = 0.5x, 8 = 1x, 16 = 2x,
+ * up to 32 = 4x (back_int.h converts; options.c parses "0.5" .. "4"). */
+static int g_render_scale = 8;
 
 void nc_hle_set_render_scale(int scale)
 {
-    g_render_scale = scale < 1 ? 1 : scale > 4 ? 4 : scale;
+    g_render_scale = scale < 4 ? 4 : scale > 32 ? 32 : scale;
 }
 
 int hle_host_render_scale(void)
 {
     return g_render_scale;
+}
+
+/* The decoder's frame pace (pb/pbdraw.c g_pace), the app's "Frame pacing" setting. */
+static int g_frame_pace = 1;
+
+void nc_hle_set_frame_pace(int on)
+{
+    g_frame_pace = on != 0;
+}
+
+int hle_host_frame_pace(void)
+{
+    return g_frame_pace;
 }
 
 /* A custom Vulkan driver's entry point (the app loads Turnip through

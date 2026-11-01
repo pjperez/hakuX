@@ -311,6 +311,8 @@ typedef struct HleCmdDraw {
                                    diffuse register's current value (float4), 0 = none */
     float wscale;               /* untransformed FF draws: 1 / the projection's W-buffer
                                    far w (W-buffering stores w / wfar); 0 = keep z */
+    uint32_t vcount;            /* indexed draws: every index is below it (the indices
+                                   are rebased to 0); 0 = not known */
 } HleCmdDraw;
 
 #define HLE_DRAW_GUEST_FVF (1u << 31)

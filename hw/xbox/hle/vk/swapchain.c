@@ -42,7 +42,7 @@
 #define PS_FRAMES 3             /* the presenter's submits in flight */
 #define PS_RAMP 1024            /* a frame's share of the ramp buffer (768 used) */
 
-enum { P_BILINEAR, P_AREA, P_SGSR, P_FXAA, P_COUNT };
+enum { P_BILINEAR, P_AREA, P_SGSR, P_PLAIN, P_FXAA, P_COUNT };
 
 typedef struct PsFrame {
     VkCommandPool pool;
@@ -97,6 +97,7 @@ static struct {
     /* the display's gamma ramp */
     uint8_t ramp[3][256];
     uint32_t ramp_gen;
+    bool ramp_identity;         /* the ramp changes nothing: P_PLAIN for P_BILINEAR */
     /* the last present went through, of f (have), the ramp and the caller's
      * key (hle_present_unchanged) */
     bool shown;
@@ -139,6 +140,13 @@ static const char k_fs_bilinear[] =
     "void main() {\n"
     "  o = ramp(texture(u_tex, v_uv).rgb);\n"
     "}\n";
+/* Bilinear through an identity ramp: no lookups (three dynamically indexed
+ * uniform loads a pixel; on the Mali-G52 the present pass took 1.3 ms of
+ * every frame at 960x720). */
+static const char k_fs_plain[] =
+    "void main() {\n"
+    "  o = vec4(texture(u_tex, v_uv).rgb, 1.0);\n"
+    "}\n";
 /* Down: each window pixel covers extra.xy frame pixels (at most 6 a side
  * counted), each weighted by how much of it it covers: a box filter (on an
  * axis scaled up, 1 pixel wide: the same as bilinear). */
@@ -161,19 +169,28 @@ static const char k_fs_area[] =
     "  o = ramp(sum / wsum);\n"
     "}\n";
 /* FXAA 3.11 Quality as PCSX2 tunes it (edges only: no subpixel blur), into
- * a frame-sized image: no ramp yet. */
+ * a frame-sized image: no ramp yet. Green is the luma (FXAA_GREEN_AS_LUMA),
+ * and the 3x3 neighbourhood comes in two gathers (FXAA_GATHER4_ALPHA's
+ * layout, on green) and two fetches for the edge pixels' other corners:
+ * nine RGB fetches and dot products took 2.1 ms of every frame at 640x480
+ * on the Mali-G52, whose texture unit was the limit. */
 static const char k_fs_fxaa[] =
     "const float EDGE_THRESHOLD = 0.063, EDGE_THRESHOLD_MIN = 0.0, SUBPIX = 0.0;\n"
     "const float STEP[12] = float[12](1.5, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0, 8.0);\n"
-    "float luma(vec3 c) { return dot(c, vec3(0.2126729, 0.7151522, 0.0721750)); }\n"
-    "float luma_at(vec2 p) { return luma(textureLod(u_tex, p, 0.0).rgb); }\n"
-    "#define LUMA_OFF(x, y) luma(textureLodOffset(u_tex, posM, 0.0, ivec2(x, y)).rgb)\n"
+    "float luma_at(vec2 p) { return textureLod(u_tex, p, 0.0).g; }\n"
+    "#define LUMA_OFF(x, y) textureLodOffset(u_tex, posM, 0.0, ivec2(x, y)).g\n"
     "void main() {\n"
     "  vec2 rcp = 1.0 / vec2(textureSize(u_tex, 0));\n"
     "  vec2 posM = v_uv;\n"
     "  vec3 rgbM = textureLod(u_tex, posM, 0.0).rgb;\n"
-    "  float lumaM = luma(rgbM);\n"
-    "  float lumaS = LUMA_OFF(0, 1), lumaE = LUMA_OFF(1, 0), lumaN = LUMA_OFF(0, -1), lumaW = LUMA_OFF(-1, 0);\n"
+    "  float lumaM = rgbM.g;\n"
+    /* gathered at the texel's corners, where the 2x2 footprint is never in
+     * doubt (at its centre, rounding picked the one beside it now and then:
+     * dots along edges): bottom right (S, SE, E, M), top left (W, M, N, NW) */
+    "  vec2 tl = floor(posM / rcp) * rcp;\n"
+    "  vec4 luma4A = textureGather(u_tex, tl + rcp, 1);\n"
+    "  vec4 luma4B = textureGather(u_tex, tl, 1);\n"
+    "  float lumaS = luma4A.x, lumaE = luma4A.z, lumaN = luma4B.z, lumaW = luma4B.x;\n"
     "  float rangeMax = max(max(lumaN, lumaW), max(lumaE, max(lumaS, lumaM)));\n"
     "  float rangeMin = min(min(lumaN, lumaW), min(lumaE, min(lumaS, lumaM)));\n"
     "  float range = rangeMax - rangeMin;\n"
@@ -181,7 +198,7 @@ static const char k_fs_fxaa[] =
     "    o = vec4(rgbM, 1.0);\n"
     "    return;\n"
     "  }\n"
-    "  float lumaNW = LUMA_OFF(-1, -1), lumaSE = LUMA_OFF(1, 1), lumaNE = LUMA_OFF(1, -1), lumaSW = LUMA_OFF(-1, 1);\n"
+    "  float lumaNW = luma4B.w, lumaSE = luma4A.y, lumaNE = LUMA_OFF(1, -1), lumaSW = LUMA_OFF(-1, 1);\n"
     "  float lumaNS = lumaN + lumaS, lumaWE = lumaW + lumaE;\n"
     "  float edgeHorz = abs(-2.0 * lumaW + lumaNW + lumaSW) + 2.0 * abs(-2.0 * lumaM + lumaNS) +\n"
     "                   abs(-2.0 * lumaE + lumaNE + lumaSE);\n"
@@ -444,7 +461,8 @@ static bool init(void)
         f->ramp_stale = true;
     }
     g_ps.vs = module(HLE_SHADER_VERTEX, k_vs, "");
-    static const char *const body[P_COUNT] = { k_fs_bilinear, k_fs_area, k_fs_sgsr, k_fs_fxaa };
+    static const char *const body[P_COUNT] = { k_fs_bilinear, k_fs_area, k_fs_sgsr, k_fs_plain,
+                                               k_fs_fxaa };
     for (unsigned i = 0; i < P_COUNT; i++) {
         g_ps.fs[i] = module(HLE_SHADER_FRAGMENT, k_fs_head, body[i]);
     }
@@ -894,9 +912,11 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
     uint8_t rgb[3][256];
     bool identity;
     if (hle_disp_gamma(rgb, &identity, &g_ps.ramp_gen)) {
+        g_ps.ramp_identity = true;
         for (unsigned i = 0; i < 256; i++) {
             for (unsigned c = 0; c < 3; c++) {
                 g_ps.ramp[c][i] = identity ? (uint8_t)i : rgb[c][i];
+                g_ps.ramp_identity &= g_ps.ramp[c][i] == i;
             }
         }
         for (unsigned i = 0; i < PS_FRAMES; i++) {
@@ -964,8 +984,11 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
             pc[6] = (float)g_ps.f.w;
             pc[7] = (float)g_ps.f.h;
         }
-        quad(cb, f, 0, g_ps.pipe[p], src, pc, iw, ih);
         log_path(p, fxaa_done, (uint32_t)(vw + 0.5f), (uint32_t)(vh + 0.5f));
+        if (p == P_BILINEAR && g_ps.ramp_identity && g_ps.pipe[P_PLAIN]) {
+            p = P_PLAIN;
+        }
+        quad(cb, f, 0, g_ps.pipe[p], src, pc, iw, ih);
     }
     T.vkCmdEndRendering(cb);
     barrier(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,

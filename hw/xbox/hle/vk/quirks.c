@@ -126,7 +126,8 @@ static bool mali_g52_arm(const HleDriver *d)
  * and releases are untested, so they keep it. */
 static bool not_turnip_not_g52_arm(const HleDriver *d)
 {
-    return !mesa_turnip(d) && !mali_g52_arm(d);
+    /* malisx2 presents through Mesa's runtime, as Turnip does */
+    return !mesa_turnip(d) && !malisx2(d) && !mali_g52_arm(d);
 }
 
 /* Timestamp queries that never resolve: ARMSX2's Mali-G615, and the G52's

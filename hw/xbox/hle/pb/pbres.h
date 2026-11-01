@@ -12,6 +12,8 @@
 uint32_t hle_draw_arena_alloc(uint32_t len, uint8_t **ptr);
 /* The same, 16 bytes aligned instead of 256 (a draw's indices). */
 uint32_t hle_draw_arena_alloc16(uint32_t len, uint8_t **ptr);
+/* The same, at a multiple of align (any value, not only powers of two). */
+uint32_t hle_draw_arena_alloc_at(uint32_t len, uint32_t align, uint8_t **ptr);
 /* The texels of header words h5 (P8: palette pal, npal entries) defined as
  * object id's image (HLE_OP_TEX); id, or 0 if they can't be. *bytes: the
  * span of guest memory they came from. */
