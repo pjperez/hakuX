@@ -1098,6 +1098,7 @@ static struct {
     uint32_t blit_in[8], blit_out[8];   /* the blits' POINT_IN / POINT_OUT, by subchannel */
     struct { uint32_t pa, v; } patch[SC_PATCHES];   /* words the blits read will write */
     unsigned npatch;
+    unsigned live;                      /* of them not yet read (pa != 0) */
 } g_sc;
 
 static void scout_report(uint32_t v)
@@ -1130,6 +1131,7 @@ static void scout_blit(unsigned subch, uint32_t size)
     const uint32_t *src = (const uint32_t *)hle_pa_ptr(so, 4 * w);
     for (uint32_t i = 0; src && i < w; i++) {
         unsigned k = g_sc.npatch++ % SC_PATCHES;
+        g_sc.live += !g_sc.patch[k].pa;
         g_sc.patch[k].pa = d + 4 * i;
         g_sc.patch[k].v = src[i];
     }
@@ -1159,8 +1161,9 @@ static const uint32_t *scout_fetch(void *ctx, uint32_t pa, uint32_t n)
     static uint32_t v;
     for (unsigned i = 0; n == 1 && i < MIN(g_sc.npatch, SC_PATCHES); i++) {
         const unsigned k = (g_sc.npatch - 1 - i) % SC_PATCHES;
-        if (g_sc.patch[k].pa == pa) {
+        if (pa && g_sc.patch[k].pa == pa) {
             g_sc.patch[k].pa = 0;
+            g_sc.live--;
             v = g_sc.patch[k].v;
             return &v;
         }
@@ -1228,20 +1231,146 @@ static uint32_t scout_take(void *opaque, unsigned subch, uint32_t m, bool noninc
     return n;
 }
 
-static int scout_method(void *opaque, unsigned subch, uint32_t m, uint32_t v)
-{
-    int stall = HLE_PB_GO;
-    scout_take(opaque, subch, m, false, &v, 1, &stall);
-    return stall;
-}
-
-static const HlePbSink k_scout = { NULL, scout_method, scout_take, NULL };
-
 /* Words the scout reads at one PUT at most (16 MiB, more than a frame's
  * push buffer): off the stream, it went round old commands forever in the
  * guest's thread (Halo 2's boot: a channel set-up through CACHE1, then a new
  * push buffer; the scout stayed in the old one, which jumps to its start). */
 #define SCOUT_BUDGET (4u << 20)
+
+/* Whether scout_take has a use for the n words from method m on subch: a
+ * NOP among them (a trap), the 2D objects' (a blit), the 3D object's
+ * GET_REPORT or FLIP_INCREMENT_WRITE. */
+static bool scout_wants(unsigned subch, uint32_t m, bool noninc, uint32_t n)
+{
+#define SC_HAS(x) (noninc ? m == (x) : m <= (x) && (x) < m + 4 * n)
+    if (SC_HAS(NV_NO_OPERATION)) {
+        return true;
+    }
+    const uint8_t cls = g_pb.obj_class[subch & 7];
+    return cls == NV_CLASS_SURFACES2D || cls == NV_CLASS_BLIT ||
+           (cls == 0x97 && (SC_HAS(NV097_GET_REPORT) || SC_HAS(NV097_FLIP_INCREMENT_WRITE)));
+#undef SC_HAS
+}
+
+static int scout_fail(int e, uint32_t word)
+{
+    HlePusher *p = &g_sc.p;
+    if (!p->error) {
+        p->error = e;
+        p->error_get = p->get;
+        p->error_word = word;
+    }
+    return e;
+}
+
+/* The pusher's run (pusher.c hle_pb_pusher_run) for the scout: guest RAM
+ * read in place, a packet scout_take has no use for stepped over unread and
+ * without a call. Sega GT 2002 pushes ~1.5 M packets a second: the pusher's
+ * calls for each (fetch, sink) were ~9% of the guest's thread. */
+static int scout_run(uint32_t put)
+{
+    HlePusher *p = &g_sc.p;
+    if (p->error) {
+        return p->error;
+    }
+    unsigned branches = 0;
+    const uint64_t words0 = p->words;
+    while (p->get != put) {
+        if (p->budget && p->words - words0 > p->budget) {
+            return scout_fail(HLE_PB_ERR_LOOP, 0);
+        }
+        const uint32_t room = p->get <= p->dma_limit ? (p->dma_limit - p->get) / 4 + 1 : 0;
+        if (p->left) {
+            branches = 0;
+            uint32_t n = p->left;
+            if (put > p->get) {
+                n = MIN(n, (put - p->get) / 4);
+            }
+            n = MIN(n, room);
+            if (!n) {
+                return scout_fail(HLE_PB_ERR_LIMIT, 0);
+            }
+            if (scout_wants(p->subch, p->method, p->noninc, n)) {
+                n = MIN(n, 1024u);
+                const uint32_t *w = (const uint32_t *)hle_pa_ptr(p->dma_base + p->get, 4 * n);
+                if (!w) {
+                    return scout_fail(HLE_PB_ERR_FETCH, 0);
+                }
+                int stall = HLE_PB_GO;
+                n = MAX(MIN(scout_take(NULL, p->subch, p->method, p->noninc, w, n, &stall), n), 1u);
+                p->get += 4 * n;
+                p->left -= n;
+                p->data += n;
+                p->words += n;
+                if (!p->noninc) {
+                    p->method += 4 * n;
+                }
+                if (stall != HLE_PB_GO) {
+                    return HLE_PB_OK;
+                }
+                continue;
+            }
+            p->get += 4 * n;
+            p->left -= n;
+            p->data += n;
+            p->words += n;
+            if (!p->noninc) {
+                p->method += 4 * n;
+            }
+            continue;
+        }
+        if (!room) {
+            return scout_fail(HLE_PB_ERR_LIMIT, 0);
+        }
+        const uint32_t *wp = g_sc.live ? scout_fetch(NULL, p->dma_base + p->get, 1) :
+                             (const uint32_t *)hle_pa_ptr(p->dma_base + p->get, 4);
+        if (!wp) {
+            return scout_fail(HLE_PB_ERR_FETCH, 0);
+        }
+        const uint32_t w = *wp;
+        if ((w & 0xE0000003u) == 0x20000000u || (w & 3) == 1 || (w & 3) == 2 ||
+            w == 0x00020000u) {
+            if (++branches > 65536u) {
+                return scout_fail(HLE_PB_ERR_LOOP, w);
+            }
+            p->branches++;
+            p->words++;
+            if ((w & 0xE0000003u) == 0x20000000u) {        /* old jump */
+                p->get = w & 0x1FFFFFFCu;
+            } else if ((w & 3) == 1) {                      /* jump */
+                p->get = w & ~3u;
+            } else if ((w & 3) == 2) {                      /* call */
+                if (p->sub_active) {
+                    return scout_fail(HLE_PB_ERR_CALL, w);
+                }
+                p->sub_active = true;
+                p->sub_return = p->get + 4;
+                p->get = w & ~3u;
+            } else {                                        /* return */
+                if (!p->sub_active) {
+                    return scout_fail(HLE_PB_ERR_RETURN, w);
+                }
+                p->sub_active = false;
+                p->get = p->sub_return;
+            }
+            continue;
+        }
+        const uint32_t kind = w & 0xE0030003u;
+        if (kind != 0 && kind != 0x40000000u) {
+            return scout_fail(HLE_PB_ERR_INVALID, w);
+        }
+        branches = 0;
+        p->get += 4;
+        p->words++;
+        p->headers++;
+        p->method = w & 0x1FFCu;
+        p->subch = (uint8_t)((w >> 13) & 7);
+        p->left = (w >> 18) & 0x7FFu;
+        p->count = p->left;
+        p->noninc = kind != 0;
+    }
+    return HLE_PB_OK;
+}
 
 /* Whether the decoder is past the trap the scout waits at: among its traps
  * past since the scout's last find (more than its ring holds: past it). */
@@ -1279,6 +1408,8 @@ static uint32_t scout_to(uint32_t put)
         g_sc.synced = true;
         g_sc.at_trap = false;
         g_sc.npatch = 0;
+        g_sc.live = 0;
+        memset(g_sc.patch, 0, sizeof(g_sc.patch));
         /* the format, pitches and DMA objects come with the device's set-up,
          * long before: the decoder's (its offsets are behind, the scout's
          * own come with each blit) */
@@ -1290,7 +1421,7 @@ static uint32_t scout_to(uint32_t put)
         return g_sc.frame;
     }
     g_sc.at_trap = false;
-    if (hle_pb_pusher_run(&g_sc.p, put, scout_fetch, NULL, &k_scout) == HLE_PB_ERR_LOOP) {
+    if (scout_run(put) == HLE_PB_ERR_LOOP) {
         static unsigned logged;                 /* it syncs again at the next PUT */
         if (logged++ < 8) {
             hle_log("hakuX-hle-pb", "report scout: lost the stream at GET %08x (PUT %08x, %s)",
