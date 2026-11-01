@@ -1901,13 +1901,14 @@ void hle_pb_diag(void)
                 (unsigned long long)nbr, (unsigned long long)hot);
     }
     static uint64_t prev_rw;
-    uint64_t rw, rns, rto, rheld;
-    hle_barrier_report_stats(&rw, &rns, &rto, &rheld);
+    uint64_t rw, rns, rto, rheld, rset;
+    hle_barrier_report_stats(&rw, &rns, &rto, &rheld, &rset);
     if (rw != prev_rw) {
         hle_log("hakuX-hle-pb", "report gate: %llu reads waited for their visibility tests (+%llu), "
-                "%.1f ms in all, %llu given up, %llu at once (the decoder held short of them)",
+                "%.1f ms in all, %llu given up, %llu at once (the decoder held short of them), "
+                "%llu reports settled with their last result",
                 (unsigned long long)rw, (unsigned long long)(rw - prev_rw), (double)rns / 1e6,
-                (unsigned long long)rto, (unsigned long long)rheld);
+                (unsigned long long)rto, (unsigned long long)rheld, (unsigned long long)rset);
         prev_rw = rw;
     }
     hle_back_draw_diag();               /* the back end's state recorded per draw (hakuX-hle-emit) */
