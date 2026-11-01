@@ -182,6 +182,8 @@ void hle_draw_rs_brief(uint32_t out[9]);
  * hle_draw_snap copies it and the draw samples the copy; hle_draw_snap_end
  * after the draw. */
 bool hle_draw_snap_needed(const HleCmdDraw *c, uint32_t rt_id);
+/* Draw merging's environment (batch.h hle_merge_init), after hle_batch_init */
+void hle_draw_merge_init(void);
 void hle_draw_snap(VkCommandBuffer cb, HleVkSurf *rt);
 void hle_draw_snap_end(void);
 /* Draw c tests depth EQUAL without writing it: HLE_FB_ZEQ24 / ZEQ16

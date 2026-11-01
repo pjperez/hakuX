@@ -6,6 +6,7 @@
  * draw recording. Render thread only.
  */
 #include "hw/xbox/hle/base.h"
+#include <ctype.h>
 #include <math.h>
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
@@ -36,6 +37,11 @@
                                    prebuild fills at most half (hle_draw_prebuild) */
 #define HLE_MAX_PROGS    1024
 #define HLE_CONST_BYTES  ((HLE_VSH_CONSTANTS + HLE_VSH_CUR_REGS) * 16)  /* c[], vcur[] */
+
+/* PipeKey.topo_class: the pipeline's merged variant (batch.h, merged_src) */
+#define TOPO_MERGED 0x80000000u
+static bool g_merge_on;                 /* draw merging (batch.h) */
+static uint32_t g_merge_win;            /* set 1's window for merged pipelines */
 
 /* 5659 render-state indices (D3DRENDERSTATETYPE) */
 enum {
@@ -178,6 +184,11 @@ static struct {
     VkDescriptorPool cpool;
     VkDescriptorSet cset;
     VkDescriptorSet fset;               /* set 1 for FF draws: the FF uniform block */
+    /* Draw merging (batch.c hle_merge_*): merged pipelines' layout (set 3,
+     * the push ring, after the usual sets and push range, so those stay
+     * compatible), set 1 as a window of HLE_MERGE_WIN bytes on the arena */
+    VkPipelineLayout mlayout;
+    VkDescriptorSet mset;
     /* Push constants smaller than the block (caps.push off: Xclipse): set 3,
      * the blocks in a host-visible ring of storage buffer windows, a part per
      * command buffer in flight (hle_draw_slot); set 2 empty without fbfetch */
@@ -209,6 +220,12 @@ static struct {
     /* and with per-draw data (Dolphin's way, bindless): push constants
      * (texture slots, ...) may change too */
     uint64_t batch_pd;
+    /* of those, by how the draw's vertices sit in its run's (MR_*): in one
+     * vertex space with the run's (binding offsets a whole number of
+     * vertices apart) and not overlapping, overlapping one of them (the
+     * same range: a mesh drawn again), apart by more than 64k vertices,
+     * not in one space, indexed with no vertex count */
+    uint64_t mr[6];
     uint64_t nomerge[5];                /* why not: strip/fan, indexed, state, other work, vertex gap */
     uint64_t drops[6];                  /* draws dropped, by DROP_* reason */
     uint64_t whites[6];                 /* stages sampled white, by WHITE_* reason */
@@ -432,6 +449,9 @@ static void pipe_async_init(void);
 /* caps.push off: the push blocks' set (3) and ring (hle_draw_push) */
 static bool push_ring_init(void)
 {
+    if (g_dr.pmap) {                    /* made already (push blocks, merging) */
+        return true;
+    }
     VkDescriptorSetLayoutBinding b = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1,
                                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                        NULL };
@@ -475,7 +495,8 @@ static bool push_ring_init(void)
     }
     T.vkBindBufferMemory(g_hvk.dev, g_dr.pbuf, g_dr.pmem, 0);
     T.vkMapMemory(g_hvk.dev, g_dr.pmem, 0, size, 0, (void **)&g_dr.pmap);
-    VkDescriptorBufferInfo bi = { g_dr.pbuf, 0, HLE_PUSH_BYTES };
+    VkDescriptorBufferInfo bi = { g_dr.pbuf, 0, g_hle_push_ssbo ? HLE_PUSH_BYTES
+                                                                : HLE_MERGE_MAX * HLE_MERGE_REC };
     VkWriteDescriptorSet w = {
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_dr.pset, .dstBinding = 0,
         .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC,
@@ -729,9 +750,9 @@ int hle_draw_init(void)
     VkDescriptorSetLayoutCreateInfo cci = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .bindingCount = 1, .pBindings = &cb };
-    VkDescriptorPoolSize cps = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 2 };
+    VkDescriptorPoolSize cps = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3 };
     VkDescriptorPoolCreateInfo cpi = {
-        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2,
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 3,
         .poolSizeCount = 1, .pPoolSizes = &cps };
     if (T.vkCreateDescriptorSetLayout(g_hvk.dev, &cci, NULL, &g_dr.cdsl) != VK_SUCCESS ||
         T.vkCreateDescriptorPool(g_hvk.dev, &cpi, NULL, &g_dr.cpool) != VK_SUCCESS) {
@@ -768,6 +789,11 @@ int hle_draw_init(void)
         hle_log("hakuX-hle-back", "push blocks: no storage buffer ring");
         return -1;
     }
+    /* draw merging: the ring holds the merged draws' blocks (set 3), with
+     * dynamic vertex input (the draw number's stream) and push constants
+     * (the merged layout keeps their range) */
+    g_merge_on = hle_merge_wanted() && g_hvk.caps.vids && !g_hle_push_ssbo &&
+                 g_hvk.caps.bindless && push_ring_init();
     VkPushConstantRange pr = { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(HleFfPush) };
     /* set 2 (devices with fbfetch): the colour target and the depth buffer
@@ -809,6 +835,30 @@ int hle_draw_init(void)
         .pPushConstantRanges = &pr };
     if (T.vkCreatePipelineLayout(g_hvk.dev, &lci, NULL, &g_dr.layout) != VK_SUCCESS) {
         return -1;
+    }
+    if (g_merge_on) {
+        VkPipelineLayoutCreateInfo mli = lci;
+        mli.setLayoutCount = 4;
+        if (!g_hvk.caps.fbfetch) {
+            sets[2] = g_dr.edsl;
+        }
+        VkDescriptorSetAllocateInfo mai = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = g_dr.cpool, .descriptorSetCount = 1, .pSetLayouts = &g_dr.cdsl };
+        g_merge_win = MIN(HLE_MERGE_WIN, g_hvk.props.limits.maxUniformBufferRange);
+        if (T.vkCreatePipelineLayout(g_hvk.dev, &mli, NULL, &g_dr.mlayout) != VK_SUCCESS ||
+            T.vkAllocateDescriptorSets(g_hvk.dev, &mai, &g_dr.mset) != VK_SUCCESS) {
+            g_merge_on = false;
+        } else {
+            VkDescriptorBufferInfo mbi = { g_harena.buf, 0, g_merge_win };
+            VkWriteDescriptorSet mw = {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = g_dr.mset,
+                .dstBinding = 0, .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .pBufferInfo = &mbi };
+            T.vkUpdateDescriptorSets(g_hvk.dev, 1, &mw, 0, NULL);
+        }
+        hle_log("hakuX-hle-back", "draw merging %s (set 1 window %u KiB)",
+                g_merge_on ? "on" : "off", g_merge_win >> 10);
     }
     /* slot 0: a 1x1 white texture; sampler 0: the default (point, wrap) */
     g_dr.white = (HleVkTex){ .w = 1, .h = 1, .levels = 1, .faces = 1 };
@@ -2115,6 +2165,86 @@ static VkPipeline pipeline(const PipeKey *k, HleVkSurf *target, bool *pending)
     return p;
 }
 
+/* The key's merged variant (batch.h): built by the workers, never in place
+ * (draws go unmerged meanwhile); NULL while it isn't, or can't be. */
+static VkPipeline merged_pipeline(const PipeKey *k)
+{
+    static PipeKey last;
+    static VkPipeline last_p;
+    static bool last_ok;
+    if (last_ok && memcmp(k, &last, g_key_bytes) == 0) {
+        return last_p;
+    }
+    PipeKey m = *k;
+    m.topo_class |= TOPO_MERGED;
+    const uint64_t h = key_hash(&m, g_key_bytes);
+    VkPipeline p = VK_NULL_HANDLE;
+    bool settled = true;
+    int i = pipe_lookup(h);
+    if (i >= 0) {
+        HlePipe *e = &g_dr.pipes[i];
+        if (e->state == PIPE_PENDING) {
+            settled = false;
+        } else {
+            if (e->state == PIPE_PREBUILT) {
+                e->state = PIPE_READY;
+                hle_pipe_touch(h);
+            }
+            p = e->pipe;
+        }
+    } else if (g_dr.npipes < HLE_MAX_PIPES) {
+        uint32_t nslots = 0;
+        const uint32_t *tok = m.vsh ? prog_find(m.vsh, &nslots) : NULL;
+        if (hle_pipe_async() && (!m.vsh || tok) && hle_pipe_queue(h, &m, m.vsh, tok, nslots)) {
+            pipe_add(h, VK_NULL_HANDLE, PIPE_PENDING);
+            settled = false;
+        } else {
+            pipe_add(h, VK_NULL_HANDLE, PIPE_READY);    /* not to be merged */
+        }
+    }
+    last = *k;
+    last_p = p;
+    last_ok = settled;
+    return p;
+}
+
+/* Merged draws' records into the push ring (batch.h HleMergeEnv.push_put) */
+static bool merge_push_put(const void *recs, uint32_t bytes, uint32_t *off)
+{
+    const uint32_t align = MAX(16u, (uint32_t)g_hvk.props.limits.minStorageBufferOffsetAlignment);
+    const uint32_t pos = (g_dr.ppos + align - 1) & ~(align - 1);
+    if (pos + HLE_MERGE_MAX * HLE_MERGE_REC > PUSH_PART_BYTES) {
+        return false;                   /* the descriptor's range must fit too */
+    }
+    *off = g_dr.pbase + pos;
+    memcpy(g_dr.pmap + *off, recs, bytes);
+    g_dr.ppos = pos + bytes;
+    return true;
+}
+
+static void merge_index_range(VkCommandBuffer cb, uint32_t first, uint32_t count, uint32_t min,
+                              uint32_t max)
+{
+    g_set_index_range(cb, first, count, min, max);
+}
+
+void hle_draw_merge_init(void)
+{
+    if (!g_merge_on) {
+        return;
+    }
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(g_hvk.phys, VK_FORMAT_R8_UINT, &fp);
+    const bool r8 = fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+    HleMergeEnv e = {
+        .layout = g_dr.layout, .mlayout = g_dr.mlayout, .mset = g_dr.mset, .pset = g_dr.pset,
+        .win = g_merge_win, .arena_size = g_harena.alloc.size, .blk = HLE_CONST_BYTES,
+        .id_fmt = r8 ? VK_FORMAT_R8_UINT : VK_FORMAT_R32_UINT, .id_bytes = r8 ? 1 : 4,
+        .push_put = merge_push_put,
+        .index_range = g_set_index_range ? merge_index_range : NULL };
+    hle_merge_init(&e);
+}
+
 /* d stays dynamic: extended dynamic state's only with it (else k->ds) */
 static bool dyn_kept(VkDynamicState d)
 {
@@ -2141,6 +2271,84 @@ static bool dyn_kept(VkDynamicState d)
  * SPIR-V, the Vulkan pipeline. No render-thread state: the workers and the
  * prebuild run it too. cache_only: SPIR-V from the disk cache and the
  * pipeline from the driver's cache, HLE_PB_COMPILE when either would compile. */
+/*
+ * Draw merging (batch.c hle_merge_*): a merged pipeline's shaders are the
+ * pipeline's own, rewritten. The push block becomes set 3's array of the
+ * merged draws' blocks (the ring), indexed by the draw's number: a vertex
+ * attribute (location HLE_MERGE_LOC, a byte per vertex) the vertex shader
+ * hands on as a flat varying (location HLE_MERGE_VARY). Set 1 is a window
+ * of g_merge_win bytes holding every draw's constants: a block's c[] and
+ * f[] are read from its draw's base (the block's cbase, in vec4s). The
+ * texture indices were nonuniformEXT already. False: no room.
+ */
+static bool str_replace(char *src, size_t cap, const char *from, const char *to, bool all,
+                        bool token)
+{
+    const size_t lf = strlen(from), lt = strlen(to);
+    size_t len = strlen(src);
+    bool found = false;
+    for (char *p = strstr(src, from); p; p = strstr(p, from)) {
+        if (token && p > src && (isalnum((unsigned char)p[-1]) || p[-1] == '_')) {
+            p += lf;
+            continue;
+        }
+        if (len - lf + lt + 1 > cap) {
+            return false;
+        }
+        memmove(p + lt, p + lf, len - (size_t)(p - src) - lf + 1);
+        memcpy(p, to, lt);
+        len = len - lf + lt;
+        p += lt;
+        found = true;
+        if (!all) {
+            break;
+        }
+    }
+    return found || all;
+}
+
+static bool merged_src(char *src, size_t cap, bool vs)
+{
+    char head[1024];
+    snprintf(head, sizeof(head),
+             "struct PushT {\n" HLE_PUSH_MEMBERS_GLSL "  uint cbase;\n};\n"
+             "layout(set = 3, binding = 0, std430) readonly buffer PushA { PushT b[]; } pca;\n"
+             "%s"
+             "#define pc pca.b[DRAW]\n#define CB int(pc.cbase)\n",
+             vs ? "layout(location = " HLE_STR(HLE_MERGE_LOC) ") in uint aDraw;\n"
+                  "layout(location = " HLE_STR(HLE_MERGE_VARY) ") flat out uint vDraw;\n"
+                  "#define DRAW aDraw\n"
+                : "layout(location = " HLE_STR(HLE_MERGE_VARY) ") flat in uint vDraw;\n"
+                  "#define DRAW vDraw\n");
+    if (!str_replace(src, cap, HLE_PUSH_GLSL, head, false, false)) {
+        return false;
+    }
+    if (!vs) {
+        return true;
+    }
+    /* the constants: the window's, from the draw's base (after the block) */
+    char *body = strstr(src, "#define CB int(pc.cbase)\n");
+    const size_t at = (size_t)(body - src) + strlen("#define CB int(pc.cbase)\n");
+    if (strstr(src, "uniform FfConst {")) {
+        char from[64];
+        snprintf(from, sizeof(from), "uniform FfConst { vec4 f[%u]; };", HLE_FFU_COUNT);
+        if (!str_replace(src, cap, from, "uniform FfConst { vec4 fw[4096]; };", false, false) ||
+            !str_replace(src + at, cap - at, "f[", "fw[CB + ", true, true)) {
+            return false;
+        }
+    }
+    if (strstr(src, "uniform VshConst {")) {
+        if (!str_replace(src, cap, "uniform VshConst { vec4 c[192]; vec4 vcur[16]; };",
+                         "uniform VshConst { vec4 cw[4096]; };", false, false) ||
+            !str_replace(src + at, cap - at, "c[", "cw[CB + ", true, true) ||
+            !str_replace(src + at, cap - at, "vcur[", "cw[CB + 192 + ", true, true)) {
+            return false;
+        }
+    }
+    return str_replace(src, cap, "void main() {\n", "void main() {\n  vDraw = aDraw;\n", false,
+                       false);
+}
+
 static HlePbResult pipeline_build(const void *key, const uint32_t *tok, uint32_t nslots,
                                   bool cache_only, VkPipeline *out)
 {
@@ -2168,6 +2376,15 @@ static HlePbResult pipeline_build(const void *key, const uint32_t *tok, uint32_t
     }
     if (g_hle_glsl_fixed && !hle_glsl_fixed_slots(fsrc, SRC_MAX)) {
         hle_log("hakuX-hle-pipe", "pixel shader: too long for the draw set's places");
+        return HLE_PB_FAILED;
+    }
+    const bool merged = (k->topo_class & TOPO_MERGED) != 0;
+    if (merged && !g_merge_on) {
+        return HLE_PB_FAILED;           /* a recorded variant, merging off this time */
+    }
+    if (merged && (!merged_src(vsrc, SRC_MAX, true) || !merged_src(fsrc, SRC_MAX, false))) {
+        hle_log("hakuX-hle-pipe", "merged variant (vsh=%016llx): the shaders could not be "
+                "rewritten", (unsigned long long)k->vsh);
         return HLE_PB_FAILED;
     }
     if (unsup && !cache_only) {
@@ -2204,7 +2421,7 @@ static HlePbResult pipeline_build(const void *key, const uint32_t *tok, uint32_t
             VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
         VkPipelineInputAssemblyStateCreateInfo ia = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-            .topology = k_class[k->topo_class] };
+            .topology = k_class[k->topo_class & ~TOPO_MERGED] };
         VkPipelineViewportStateCreateInfo vp = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
             .viewportCount = 1, .scissorCount = 1 };
@@ -2314,7 +2531,7 @@ static HlePbResult pipeline_build(const void *key, const uint32_t *tok, uint32_t
             .pVertexInputState = g_hvk.caps.vids ? NULL : &vis,
             .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms,
             .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy,
-            .layout = g_dr.layout };
+            .layout = merged ? g_dr.mlayout : g_dr.layout };
         if (cache_only) {
             gci.flags = VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
         }
@@ -2536,6 +2753,8 @@ static uint32_t sscl_code(uint32_t e8, unsigned st)
     uint32_t code = e8 == 4 ? 1 : e8 == 16 ? 2 : e8 == 32 ? 3 : 0;
     return code << (24u + 2u * st);
 }
+
+enum { MR_OK, MR_SAME, MR_OVERLAP, MR_FAR, MR_SPACE, MR_UNKNOWN };
 
 /* Why a stage with a texture sampled the white one (stage_slot); "self":
  * the target the draw renders, which fbfetch may read instead */
@@ -3487,6 +3706,19 @@ static uint32_t first_vertex(uint32_t n, const uint32_t *stride, VkDeviceSize *o
     return (uint32_t)q;
 }
 
+/* A pipeline whose draws can be merged (batch.h): its vertex shader leaves the
+ * draw number's location free */
+static bool mergeable_key(const PipeKey *k)
+{
+    return !(k->vsh && (k->vk.in_mask >> HLE_MERGE_LOC) & 1);
+}
+
+static bool prim_list(uint32_t prim)
+{
+    return prim == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || prim == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
+           prim == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+}
+
 void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, uint32_t ds_id,
                        const HleCmdViewport *vpc)
 {
@@ -4394,9 +4626,65 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
                 }
             }
             const bool idx = c->ib_off != UINT32_MAX;
+            /* the draw's vertices: [lo, hi) in its own vertex space */
+            const int64_t lo = vfirst, hi = (int64_t)vfirst + (idx ? c->vcount : c->count);
+            static struct {
+                uint32_t nb, n;
+                VkDeviceSize offs[HLE_DRAW_MAX_BIND];
+                uint32_t strides[HLE_DRAW_MAX_BIND];
+                int64_t r[64][2], min, max;
+            } run;
+            bool joined = false;
             if (pvalid && !other_pd && hle_back_breaks == pbreaks && pprim == c->prim &&
                 pidx == idx) {
                 g_dr.batch_pd++;
+                /* the vertex delta to the run's space: the same for every binding */
+                bool same = nb == run.nb;
+                int64_t d = 0;
+                for (uint32_t i = 0; same && i < nb; i++) {
+                    const int64_t diff = (int64_t)offs[i] - (int64_t)run.offs[i];
+                    const int64_t st = strides[i];
+                    if (st != run.strides[i] || (st ? diff % st : diff) != 0) {
+                        same = false;
+                    } else if (st) {
+                        if (i && d != diff / st) {
+                            same = false;
+                        }
+                        d = diff / st;
+                    }
+                }
+                unsigned why = MR_OK;
+                if (idx && !c->vcount) {
+                    why = MR_UNKNOWN;
+                } else if (!same) {
+                    why = MR_SPACE;
+                } else {
+                    const int64_t a = lo + d, b = hi + d;
+                    for (uint32_t i = 0; i < run.n && why == MR_OK; i++) {
+                        if (a < run.r[i][1] && run.r[i][0] < b) {
+                            why = a == run.r[i][0] && b == run.r[i][1] ? MR_SAME : MR_OVERLAP;
+                        }
+                    }
+                    if (why == MR_OK && (MAX(b, run.max) - MIN(a, run.min) > 65536 || run.n == 64)) {
+                        why = MR_FAR;
+                    }
+                    if (why == MR_OK) {
+                        run.r[run.n][0] = a;
+                        run.r[run.n++][1] = b;
+                        run.min = MIN(run.min, a);
+                        run.max = MAX(run.max, b);
+                        joined = true;
+                    }
+                }
+                g_dr.mr[why]++;
+            }
+            if (!joined) {                  /* a run starts with this draw */
+                run.nb = nb;
+                memcpy(run.offs, offs, sizeof(offs[0]) * nb);
+                memcpy(run.strides, strides, sizeof(strides[0]) * nb);
+                run.n = 1;
+                run.r[0][0] = run.min = lo;
+                run.r[0][1] = run.max = hi;
             }
             if (pvalid && !other && hle_back_breaks == pbreaks && pprim == c->prim && pidx == idx) {
                 g_dr.batchable++;
@@ -4449,6 +4737,12 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
             if (g_set_index_range && c->vcount) {
                 g_set_index_range(cb, c->ib_off / 2, n, 0, c->vcount - 1);
             }
+            if (g_merge_on && q < 0 && !g_hle_gpucut && c->vcount && mergeable_key(&k)) {
+                hle_merge_next(&(HleMergeNext){
+                    .merged = merged_pipeline(&k),
+                    .indices = (const uint16_t *)(g_harena.map + c->ib_off), .vcount = c->vcount,
+                    .strip = !prim_list(c->prim) });
+            }
             T.vkCmdDrawIndexed(cb, n, 1, c->ib_off / 2, (int32_t)vfirst, 0);
         }
         if (q >= 0) {
@@ -4461,13 +4755,21 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
             /* debug: the state alone */
         } else if (g_hle_gpucut == 4) {
             T.vkCmdDraw(cb, MIN(c->count, 3u), 1, vfirst, 0);  /* debug: a draw's own cost */
-        } else if (q < 0 && (c->prim == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
-                      c->prim == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
-                      c->prim == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) &&
-            hle_batch_draw(cb, (VkPrimitiveTopology)c->prim, vfirst, c->count)) {
-            /* held: recorded with the strips that follow it (a probed draw never is) */
         } else {
-            T.vkCmdDraw(cb, c->count, 1, vfirst, 0);
+            /* merged (batch.h) when its variant is built, else strips batched */
+            const VkPipeline mp = g_merge_on && q < 0 && !g_hle_gpucut && mergeable_key(&k)
+                                      ? merged_pipeline(&k) : VK_NULL_HANDLE;
+            if (mp) {
+                hle_merge_next(&(HleMergeNext){ .merged = mp, .strip = !prim_list(c->prim) });
+                T.vkCmdDraw(cb, c->count, 1, vfirst, 0);
+            } else if (q < 0 && (c->prim == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+                                 c->prim == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
+                                 c->prim == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) &&
+                       hle_batch_draw(cb, (VkPrimitiveTopology)c->prim, vfirst, c->count)) {
+                /* held: recorded with the strips that follow it (a probed draw never is) */
+            } else {
+                T.vkCmdDraw(cb, c->count, 1, vfirst, 0);
+            }
         }
         if (q >= 0) {
             T.vkCmdEndQuery(cb, g_probe.pool, (uint32_t)q);
@@ -4518,7 +4820,7 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
 void hle_draw_ff_diag(void)
 {
     static uint64_t prev[EM_N], prev_draws, prev_merge, prev_no[5], prev_verts;
-    char line[768];
+    char line[1024];
     int n = snprintf(line, sizeof(line), "per s: draws=%llu verts=%llu mergeable=%llu (not: strip "
                      "%llu idx %llu state %llu work %llu gap %llu)",
                      (unsigned long long)(g_dr.draws - prev_draws),
@@ -4553,6 +4855,24 @@ void hle_draw_ff_diag(void)
                   (unsigned long long)(g_dr.batch_vb - prev_btv),
                   (unsigned long long)(g_dr.batch_pd - prev_bpd));
     prev_bpd = g_dr.batch_pd;
+    {
+        static uint64_t pmd, pmi;
+        uint64_t md, mi;
+        hle_merge_stats(&md, &mi);
+        n += snprintf(line + n, sizeof(line) - (size_t)n, " merged=%llu of %llu draws",
+                      (unsigned long long)(md - pmd), (unsigned long long)(mi - pmi));
+        pmd = md;
+        pmi = mi;
+    }
+    {
+        static uint64_t pm[6];
+        static const char *const k_mr[6] = { "ok", "same", "overlap", "far", "space", "unknown" };
+        for (unsigned i = 0; i < 6 && n > 0 && (size_t)n < sizeof(line); i++) {
+            n += snprintf(line + n, sizeof(line) - (size_t)n, "%s%s=%llu", i ? " " : " runs: ",
+                          k_mr[i], (unsigned long long)(g_dr.mr[i] - pm[i]));
+            pm[i] = g_dr.mr[i];
+        }
+    }
     prev_bt = g_dr.batchable;
     prev_btc = g_dr.batch_consts;
     prev_btv = g_dr.batch_vb;

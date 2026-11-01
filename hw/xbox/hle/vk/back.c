@@ -552,6 +552,7 @@ static VkCommandBuffer cb_get(void)
             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
         T.vkBeginCommandBuffer(f->cb, &bi);
         hle_batch_slot(g_back.cur);     /* this slot's indices: its last use has completed */
+        hle_merge_cb(f->cb);            /* the draws merged on it (batch.h) */
         hle_draw_slot(g_back.cur);      /* and its push blocks and fbfetch sets */
         {   /* Earlier submissions' writes before this one's commands: a frame
              * split by a kick resumes its pass here and loads the attachments
@@ -2952,6 +2953,7 @@ int hle_back_start(void)
                        HLE_THREAD_DETACHED);
     g_back.running = true;
     hle_batch_init();
+    hle_draw_merge_init();
     hle_disp_setup();
     hle_vk_set_ready();                 /* the window's presenter may start */
     hle_log("hakuX-hle-back", "back end started (zero_copy=%d)", g_hram.zero_copy);
