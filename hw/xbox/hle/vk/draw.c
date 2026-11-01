@@ -206,6 +206,9 @@ static struct {
      * the previous one (same pass, topology and indexing) is its vertex
      * constants (set 1) and/or vertex buffer offsets */
     uint64_t batchable, batch_consts, batch_vb;
+    /* and with per-draw data (Dolphin's way, bindless): push constants
+     * (texture slots, ...) may change too */
+    uint64_t batch_pd;
     uint64_t nomerge[5];                /* why not: strip/fan, indexed, state, other work, vertex gap */
     uint64_t drops[6];                  /* draws dropped, by DROP_* reason */
     uint64_t whites[6];                 /* stages sampled white, by WHITE_* reason */
@@ -4381,13 +4384,20 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
             static uint64_t pe[EM_N], pbreaks;
             static uint32_t pprim;
             static bool pvalid, pidx;
-            uint64_t other = 0;
+            uint64_t other = 0, other_pd = 0;
             for (unsigned i = 0; i < EM_N; i++) {
                 if (i != EM_SET1 && i != EM_VB) {
                     other += g_dr.emits[i] - pe[i];
                 }
+                if (i != EM_SET1 && i != EM_VB && i != EM_PC && i != EM_SET0) {
+                    other_pd += g_dr.emits[i] - pe[i];
+                }
             }
             const bool idx = c->ib_off != UINT32_MAX;
+            if (pvalid && !other_pd && hle_back_breaks == pbreaks && pprim == c->prim &&
+                pidx == idx) {
+                g_dr.batch_pd++;
+            }
             if (pvalid && !other && hle_back_breaks == pbreaks && pprim == c->prim && pidx == idx) {
                 g_dr.batchable++;
                 g_dr.batch_consts += g_dr.emits[EM_SET1] != pe[EM_SET1];
@@ -4535,10 +4545,14 @@ void hle_draw_ff_diag(void)
     prev_isame = g_dr.idx_same;
     prev_icontig = g_dr.idx_contig;
     static uint64_t prev_bt, prev_btc, prev_btv;
-    n += snprintf(line + n, sizeof(line) - (size_t)n, " batchable=%llu (consts %llu vb %llu)",
+    static uint64_t prev_bpd;
+    n += snprintf(line + n, sizeof(line) - (size_t)n, " batchable=%llu (consts %llu vb %llu; "
+                  "with per-draw data %llu)",
                   (unsigned long long)(g_dr.batchable - prev_bt),
                   (unsigned long long)(g_dr.batch_consts - prev_btc),
-                  (unsigned long long)(g_dr.batch_vb - prev_btv));
+                  (unsigned long long)(g_dr.batch_vb - prev_btv),
+                  (unsigned long long)(g_dr.batch_pd - prev_bpd));
+    prev_bpd = g_dr.batch_pd;
     prev_bt = g_dr.batchable;
     prev_btc = g_dr.batch_consts;
     prev_btv = g_dr.batch_vb;
