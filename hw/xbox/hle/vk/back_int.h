@@ -57,6 +57,10 @@ typedef struct HleVkSurf {
     /* a draw read it as an input attachment (vk/draw.c hle_draw_fb_stages):
      * passes on it render in RENDERING_LOCAL_READ from then on */
     bool local_read;
+    /* a draw sampled it (vk/draw.c hle_draw_tex_prep): it goes to
+     * SHADER_READ_ONLY when a pass on it ends for another target (back.c
+     * cmd_set_rt), not when the draw that samples it comes */
+    bool sampled;
     uint32_t nlevels, nfaces;   /* owners: the image's levels and layers */
     uint64_t dirty;            /* owners: subresources rendered since the last read barrier */
     uint32_t rendered_levels;   /* owners: levels 0..n-1 sampled (the highest rendered + 1) */
@@ -148,7 +152,9 @@ int hle_draw_init(void);
 void hle_draw_prebuild(void);
 void hle_draw_cmd_state(const HleCmdState *s);
 void hle_draw_cmd_state_part(const HleCmdStatePart *p);
-void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer cb);
+/* get_cb(fresh): the command buffer for its upload, fresh when it goes into a new
+ * image (back.c tex_cb) */
+void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer (*get_cb)(bool fresh));
 void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id,
                        uint32_t ds_id, const HleCmdViewport *vp);
 /* A recording starts (back.c cb_get, outside any pass). */
@@ -192,6 +198,8 @@ extern unsigned g_hle_zeq;
 void hle_draw_fb_bind(VkCommandBuffer cb, HleVkSurf *rt, HleVkSurf *ds, VkImageView zv,
                       bool zbar);
 extern bool g_hle_fbbar_off;            /* debug (debug.hakux.fbbar=0): no barrier */
+extern bool g_hle_texnew;               /* debug (debug.hakux.texnew=0: off): redefined textures
+                                           get new images (hle_draw_cmd_tex) */
 /* debug (debug.hakux.gpucut): 1 (frag) draws scissored to one pixel, 2 (draw)
  * the state recorded and no draw, 3 (pass) neither: the passes alone, 4 (tri)
  * draws of 3 vertices scissored to one pixel */

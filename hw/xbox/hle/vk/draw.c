@@ -626,8 +626,19 @@ void hle_draw_slot(unsigned slot)
     }
 }
 
+/* malisx2's vkCmdSetIndexRangeMALISX2 (NULL elsewhere): an indexed draw's
+ * index range, which the front end knows (HleCmdDraw vcount). The driver
+ * otherwise reads every draw's indices back from the arena to find it, and
+ * on the Mali-G52 that scan of uncached memory was half of each draw's CPU
+ * time (2.2 of 4.6 us, ~100 ms a second in a race). */
+typedef void(VKAPI_PTR *PFN_SetIndexRange)(VkCommandBuffer cb, uint32_t first, uint32_t count,
+                                           uint32_t min, uint32_t max);
+static PFN_SetIndexRange g_set_index_range;
+
 int hle_draw_init(void)
 {
+    g_set_index_range = (PFN_SetIndexRange)vkGetDeviceProcAddr(g_hvk.dev,
+                                                               "vkCmdSetIndexRangeMALISX2");
     VkDescriptorSetLayoutBinding b[4] = {
         { 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, HLE_MAX_IMAGES, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
         { 1, VK_DESCRIPTOR_TYPE_SAMPLER, HLE_MAX_SAMPLERS, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
@@ -899,6 +910,7 @@ static unsigned g_nretire;
 static uint32_t g_free_slot[HLE_MAX_IMAGES];
 static unsigned g_nfree_slot;
 static uint64_t g_tex_retired;
+bool g_hle_texnew = true;
 
 void hle_draw_tex_reap(uint64_t completed)
 {
@@ -931,13 +943,32 @@ void hle_draw_tex_stamp(uint64_t value)
     }
 }
 
+/* Room for one more retired entry. Full: everything submitted is waited
+ * for and reaped; what the open recording retired (HLE_SURF_PARKED) stays,
+ * so a table full of those has none (the entry is then leaked, not written
+ * past the end). */
+static bool retire_room(void)
+{
+    if (g_nretire < TEX_RETIRE_MAX) {
+        return true;
+    }
+    hle_tl_wait(hle_tl_submitted());
+    hle_draw_tex_reap(hle_tl_completed());
+    if (g_nretire < TEX_RETIRE_MAX) {
+        return true;
+    }
+    static bool s_said;
+    if (!s_said) {
+        s_said = true;
+        hle_log("hakuX-hle-back", "retired textures: %u in one recording, the table's size: "
+                "later ones leaked (logged once)", TEX_RETIRE_MAX);
+    }
+    return false;
+}
+
 static void tex_free(HleVkTex *t)
 {
-    if (t->img) {
-        if (g_nretire == TEX_RETIRE_MAX) {
-            hle_tl_wait(hle_tl_submitted());    /* full: everything before is done */
-            hle_draw_tex_reap(hle_tl_completed());
-        }
+    if (t->img && retire_room()) {
         g_retire[g_nretire++] = (typeof(g_retire[0])){
             .img = t->img, .view = t->view, .cube_view = t->cube_view, .mem = t->mem,
             .slot = t->slot, .after = HLE_SURF_PARKED };
@@ -964,7 +995,7 @@ static uint32_t level_bytes(uint32_t xfmt, uint32_t w, uint32_t h, uint32_t *row
     return *row * h;
 }
 
-void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer cb)
+void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer (*get_cb)(bool fresh))
 {
     TexFmt tf;
     if (g_dr.ready && !tex_format(c->xfmt, &tf)) {
@@ -981,8 +1012,20 @@ void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer cb)
     }
     HleVkTex *t = tex_find(c->id);
     uint32_t cd = c->faces == 1 && c->d > 1 ? c->d : 1;
-    if (t && (t->xfmt != c->xfmt || t->w != c->w || t->h != c->h || t->levels != c->levels ||
-              t->faces != c->faces || t->d != cd)) {
+    /* Every definition gets an image of its own, a redefinition too: the
+     * old one retires (tex_free) with the work that samples it, and the
+     * upload into the new one waits for nothing. Writing the old image
+     * again waits for every draw before that might sample it, and a tiler
+     * GPU holds its vertex work behind that (Mali's job manager).
+     * debug.hakux.texnew=0: off. A recording that redefines textures by the
+     * thousand (loading) fills the retired table with what it may still
+     * sample: from half full on, redefinitions write the same image again
+     * (a full table was written past its end: the likely reason Sega GT
+     * 2002's cars once sampled white). */
+    const bool texnew = g_hle_texnew && g_nretire < TEX_RETIRE_MAX / 2;
+    const bool fresh = texnew || !t;
+    if (t && (texnew || t->xfmt != c->xfmt || t->w != c->w || t->h != c->h ||
+              t->levels != c->levels || t->faces != c->faces || t->d != cd)) {
         tex_free(t);
         t = NULL;
     }
@@ -1018,9 +1061,10 @@ void hle_draw_cmd_tex(const HleCmdTex *c, VkCommandBuffer cb)
         t->linear = (hle_fmt_info(c->xfmt)->flags & HLE_FI_LIN) != 0;
         write_tex_slot(t);
     }
-    VkImageMemoryBarrier2 b = {
+    VkCommandBuffer cb = get_cb(fresh);
+    VkImageMemoryBarrier2 b = {         /* a new image (texnew): nothing used it before */
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+        .srcStageMask = fresh ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
         .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
         .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -1119,12 +1163,10 @@ void hle_draw_forget_surf(uint32_t id)
             i++;
             continue;
         }
-        if (g_nretire == TEX_RETIRE_MAX) {
-            hle_tl_wait(hle_tl_submitted());
-            hle_draw_tex_reap(hle_tl_completed());
+        if (retire_room()) {
+            g_retire[g_nretire++] = (typeof(g_retire[0])){
+                .slot = g_dr.sslot[i].slot, .after = HLE_SURF_PARKED };
         }
-        g_retire[g_nretire++] = (typeof(g_retire[0])){
-            .slot = g_dr.sslot[i].slot, .after = HLE_SURF_PARKED };
         g_dr.sslot[i] = g_dr.sslot[--g_dr.nsslot];
     }
 }
@@ -1404,6 +1446,7 @@ void hle_draw_tex_prep(const HleCmdDraw *c, uint32_t rt_id, VkCommandBuffer cb)
     for (unsigned st = 0; st < HLE_TSS_STAGES; st++) {
         HleVkSurf *s = tex_surface(c->tex[st], rt_id);
         if (s) {
+            s->sampled = true;
             if (s->layout == VK_IMAGE_LAYOUT_UNDEFINED) {
                 /* its texels are undefined: nothing rendered into it yet */
                 static unsigned s_logged;
@@ -4263,8 +4306,11 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
         int q = g_probe.nvsh ? probe_begin(cb, c, vfirst, (uint64_t)(uintptr_t)g_rec.pipe)
                                 : -1;
         if (g_hle_gpucut != 2) {
-            T.vkCmdDrawIndexed(cb, g_hle_gpucut == 4 ? MIN(c->count, 3u) : c->count, 1,
-                               c->ib_off / 2, (int32_t)vfirst, 0);
+            const uint32_t n = g_hle_gpucut == 4 ? MIN(c->count, 3u) : c->count;
+            if (g_set_index_range && c->vcount) {
+                g_set_index_range(cb, c->ib_off / 2, n, 0, c->vcount - 1);
+            }
+            T.vkCmdDrawIndexed(cb, n, 1, c->ib_off / 2, (int32_t)vfirst, 0);
         }
         if (q >= 0) {
             T.vkCmdEndQuery(cb, g_probe.pool, (uint32_t)q);

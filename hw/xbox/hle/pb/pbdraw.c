@@ -310,12 +310,33 @@ static uint32_t arena(uint32_t len, uint8_t **ptr)
 /* A draw's 16-bit indices: the index buffer is bound at the arena's start
  * (firstIndex), so 16 bytes apart will do where 256 wasted ~120 bytes a
  * draw, and back-to-back draws' indices end up contiguous more often (the
- * back end's strip batching). Vertex copies stay 256 apart: their binding
- * offsets then match from draw to draw, which that batching needs. */
+ * back end's strip batching). */
 static uint32_t arena_idx(uint32_t len, uint8_t **ptr)
 {
     g_phase = 1;
     uint32_t off = hle_draw_arena_alloc16(len, ptr);
+    g_phase = 0;
+    return off;
+}
+
+/* A vertex copy of a draw with one binding of stride st: at a multiple of
+ * the stride (and of 4), so that first_vertex() (vk/draw.c) folds all of
+ * the offset into firstVertex and leaves the binding at offset 0, the
+ * same for every such draw. 256 apart, as before, only kept the binding
+ * when the stride divided 256: with strides such as 24, 28 or 36 the
+ * binding moved every draw, which ended every strip run (the back end's
+ * strip batching needs nothing recorded between the draws) and cost a
+ * vertex buffer bind a draw (vb=28308/s for 37335 draws/s in Sega GT
+ * 2002's races). Draws with more bindings keep 256: their bindings do not
+ * share one firstVertex anyway. */
+static uint32_t arena_vb(uint32_t len, uint32_t st, unsigned nbind, uint8_t **ptr)
+{
+    uint32_t align = 256;
+    if (nbind == 1 && st) {
+        align = st % 4 ? st * (st % 2 ? 4 : 2) : st;
+    }
+    g_phase = 1;
+    uint32_t off = hle_draw_arena_alloc_at(len, align, ptr);
     g_phase = 0;
     return off;
 }
@@ -2932,14 +2953,31 @@ bool hle_pbd_novis(void)
 }
 
 /* debug: HAKUX_HLE_PB_KICK_MS, the periodic submit boundary's interval
- * (default 4; 0: none, a frame's swap submits) */
+ * (default 4; 0: none, a frame's swap submits); on Android also live,
+ * debug.hakux.kickms (read once a second; empty: the default). Each submit
+ * ends the open pass. */
 static int64_t kick_interval_ns(void)
 {
-    static int64_t ns = -1;
+    static int64_t ns = -1, def;
     if (ns < 0) {
         const char *e = getenv("HAKUX_HLE_PB_KICK_MS");
-        ns = e ? (int64_t)atoi(e) * 1000000 : 4000000;
+        ns = def = e ? (int64_t)atoi(e) * 1000000 : 4000000;
     }
+#ifdef __ANDROID__
+    static int64_t polled;
+    const int64_t now = hle_now_ns();
+    if (now - polled >= 1000000000) {
+        polled = now;
+        char v[PROP_VALUE_MAX];
+        hle_prop_get("debug.hakux.kickms", v);
+        const int64_t want = v[0] ? (int64_t)atoi(v) * 1000000 : def;
+        if (want != ns) {
+            ns = want;
+            hle_log("hakuX-hle-pb", "periodic submits: every %lld ms of draws (0: none)",
+                    (long long)(ns / 1000000));
+        }
+    }
+#endif
     return ns;
 }
 
@@ -3291,6 +3329,7 @@ static bool sequential(HleCmdDraw *d, uint32_t n)
     d->prim = hle_draw_prim_topology(g_pd.prim);
     d->count = cnt;
     d->ib_off = ib_off;
+    d->vcount = n;
     return true;
 }
 
@@ -3502,7 +3541,7 @@ static bool vb_realign(HleCmdDraw *d, unsigned b, const uint8_t *src, uint32_t f
     }
     const uint32_t st = d->bind_stride[b], ns = st ? ROUND_UP(end, 4u) : 0;
     uint8_t *dst;
-    const uint32_t off = arena(st ? n * ns : end, &dst);
+    const uint32_t off = arena_vb(st ? n * ns : end, ns, d->nbind, &dst);
     if (off == HLE_ARENA_FULL) {
         return false;
     }
@@ -3601,7 +3640,7 @@ static void draw_arrays(void)
             continue;
         }
         uint8_t *dst;
-        uint32_t off = src ? arena(len, &dst) : HLE_ARENA_FULL;
+        uint32_t off = src ? arena_vb(len, st, d.nbind, &dst) : HLE_ARENA_FULL;
         if (off == HLE_ARENA_FULL) {
             skip(SK_DRAW_ARRAYS_ARENA);
             return;
@@ -3658,6 +3697,7 @@ static void draw_arrays(void)
     d.prim = hle_draw_prim_topology(pt);
     d.count = cnt;
     d.ib_off = ib_off;
+    d.vcount = hi - lo + 1;
     emit(&d);
 }
 

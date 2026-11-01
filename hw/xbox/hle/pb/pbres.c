@@ -65,6 +65,11 @@ uint32_t hle_draw_arena_alloc16(uint32_t len, uint8_t **ptr)
     return arena_alloc(len, 16, ptr);
 }
 
+uint32_t hle_draw_arena_alloc_at(uint32_t len, uint32_t align, uint8_t **ptr)
+{
+    return arena_alloc(len, align, ptr);
+}
+
 /* ---- textures ------------------------------------------------------------------ */
 
 /* Packed byte size of one level of a w x h texture in format fi. */

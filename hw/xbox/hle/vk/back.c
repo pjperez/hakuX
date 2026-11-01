@@ -31,6 +31,9 @@
 typedef struct HleFrame {
     VkCommandPool pool;
     VkCommandBuffer cb;
+    /* uploads into new images (tex_cb), submitted in front of cb */
+    VkCommandBuffer ucb;
+    bool ucb_open;
     uint64_t value;
 } HleFrame;
 
@@ -481,6 +484,8 @@ static void pt_collect(unsigned slot)
     memset(g_pt.sum, 0, sizeof(g_pt.sum));
 }
 
+static bool g_cmdbar_full;              /* debug.hakux.cmdbar=full (cb_get) */
+
 static VkCommandBuffer cb_get(void)
 {
     HleFrame *f = &g_back.fr[g_back.cur];
@@ -500,13 +505,34 @@ static VkCommandBuffer cb_get(void)
         {   /* Earlier submissions' writes before this one's commands: a frame
              * split by a kick resumes its pass here and loads the attachments
              * the last submission stored. Submission order orders execution,
-             * not memory. */
+             * not memory. What the GPU writes is attachments and transfer
+             * destinations (the shaders store nothing), and what reads them
+             * is fragment work and transfers: the vertex stages read only
+             * what the CPU wrote (the arena), and the NV2A's vertex programs
+             * sample nothing. So the vertex stages are left out; "all
+             * commands" made a tiler GPU (Mali's job manager) hold every
+             * submission's vertex work until all earlier fragment work had
+             * finished, four times a frame. debug.hakux.cmdbar=full: all. */
             VkMemoryBarrier2 mb = {
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
-                .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                 .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT };
+            if (g_cmdbar_full) {
+                mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+                mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+                mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            }
             VkDependencyInfo di = {
                 .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
                 .memoryBarrierCount = 1, .pMemoryBarriers = &mb };
@@ -758,6 +784,56 @@ static inline void pend_age_check(void)
     }
 }
 
+/* debug.hakux.texhoist=0: every texture upload ends the open pass, in the
+ * frame's own command buffer */
+static bool g_tex_hoist_off;
+/* debug.hakux.prepearly=0: sampled targets turn into textures only when a
+ * draw samples them (cmd_set_rt) */
+static bool g_prep_early_off;
+
+/*
+ * The command buffer a texture upload goes in (hle_draw_cmd_tex). Into a
+ * new image (fresh), which no draw recorded so far can sample: the frame's
+ * upload command buffer, which the submit puts in front of the frame's own,
+ * and the open pass goes on. Into an image draws may have sampled: the
+ * frame's own, after the pass. Sega GT 2002 redefines a few textures a
+ * frame mid-scene, and each one split its 640x720 pass (a reload and a
+ * store of colour and depth).
+ */
+static VkCommandBuffer tex_cb(bool fresh)
+{
+    if (!fresh || g_tex_hoist_off) {
+        close_pass_why(PE_TEX);
+        return cb_get();
+    }
+    cb_get();                           /* the frame's pool, reset when it begins */
+    HleFrame *f = &g_back.fr[g_back.cur];
+    if (!f->ucb_open) {
+        VkCommandBufferBeginInfo bi = {
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT };
+        T.vkBeginCommandBuffer(f->ucb, &bi);
+        f->ucb_open = true;
+    }
+    return f->ucb;
+}
+
+/* The frame's command buffers in submission order (its own ended): the
+ * upload one first when it has uploads. */
+static uint32_t frame_cbs(HleFrame *f, VkCommandBufferSubmitInfo cbi[2])
+{
+    uint32_t n = 0;
+    if (f->ucb_open) {
+        T.vkEndCommandBuffer(f->ucb);
+        f->ucb_open = false;
+        cbi[n++] = (VkCommandBufferSubmitInfo){
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = f->ucb };
+    }
+    cbi[n++] = (VkCommandBufferSubmitInfo){
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = f->cb };
+    return n;
+}
+
 static void submit(uint64_t value)
 {
     if (g_pend.n && value >= g_pend.value) {
@@ -766,19 +842,20 @@ static void submit(uint64_t value)
     }
     close_pass_why(PE_SUBMIT);
     HleFrame *f = &g_back.fr[g_back.cur];
-    VkCommandBufferSubmitInfo cbi = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = f->cb };
+    VkCommandBufferSubmitInfo cbi[2];
     VkSemaphoreSubmitInfo sig = {
         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = hle_tl_sem(),
         .value = value, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT };
     bool has_cb = g_back.recording;
+    uint32_t ncb = 0;
     if (has_cb) {
         gput_end(f->cb, g_back.cur);
         T.vkEndCommandBuffer(f->cb);
+        ncb = frame_cbs(f, cbi);
     }
     VkSubmitInfo2 si = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .commandBufferInfoCount = has_cb ? 1 : 0, .pCommandBufferInfos = &cbi,
+        .commandBufferInfoCount = ncb, .pCommandBufferInfos = cbi,
         .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &sig };
     hle_tl_gap_serve();
     int64_t ts = hle_prof_begin();
@@ -815,11 +892,10 @@ static void flush_idle(void)
         HleFrame *f = &g_back.fr[g_back.cur];
         gput_end(f->cb, g_back.cur);
         T.vkEndCommandBuffer(f->cb);
-        VkCommandBufferSubmitInfo cbi = {
-            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = f->cb };
+        VkCommandBufferSubmitInfo cbi[2];
         VkSubmitInfo2 si = {
             .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-            .commandBufferInfoCount = 1, .pCommandBufferInfos = &cbi };
+            .commandBufferInfoCount = frame_cbs(f, cbi), .pCommandBufferInfos = cbi };
         int64_t ts = hle_prof_begin();
         uint32_t pa = hle_hitch_enter(HLE_ACT_SUBMIT);
         hle_vk_queue_lock();
@@ -1392,6 +1468,21 @@ static void cmd_set_rt(const HleCmdSetRt *c)
         if (c->rt != g_back.rt) {
             rtd_snap(g_back.rt);
         }
+        /* Targets left that draws have sampled before (an environment map,
+         * a shadow map) turn into textures now, between passes: when a draw
+         * of the next pass samples one, the pass no longer ends for it
+         * (hle_draw_tex_needs_prep). Sega GT 2002 split its 640x720 scene
+         * for that six times a frame. */
+        const uint32_t left[2] = { c->rt != g_back.rt ? g_back.rt : 0,
+                                   c->ds != g_back.ds ? g_back.ds : 0 };
+        for (unsigned i = 0; i < 2; i++) {
+            HleVkSurf *s = left[i] && !g_prep_early_off ? hle_surf_get(left[i]) : NULL;
+            if (s && s->sampled && !s->general && left[i] != c->rt && left[i] != c->ds &&
+                s->layout != VK_IMAGE_LAYOUT_UNDEFINED &&
+                s->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                hle_surf_transition(cb_get(), s, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            }
+        }
         g_back.rt = c->rt;
         g_back.ds = c->ds;
     }
@@ -1961,6 +2052,34 @@ static void back_props_poll(uint64_t swap)
         hle_log("hakuX-hle-back", "fb fetch barriers %s", g_hle_fbbar_off ? "off" : "on");
     }
     v[0] = 0;
+    hle_prop_get("debug.hakux.cmdbar", v);
+    if (!strcmp(v, "full") != g_cmdbar_full) {
+        g_cmdbar_full = !g_cmdbar_full;
+        hle_log("hakuX-hle-back", "command buffers start with %s barrier",
+                g_cmdbar_full ? "an all-commands" : "the fragment and transfer");
+    }
+    v[0] = 0;
+    hle_prop_get("debug.hakux.texnew", v);
+    if ((strcmp(v, "0") != 0) != g_hle_texnew) {
+        g_hle_texnew = !g_hle_texnew;
+        hle_log("hakuX-hle-back", "redefined textures: %s", g_hle_texnew ? "new images" :
+                "the same image while the size and format stay");
+    }
+    v[0] = 0;
+    hle_prop_get("debug.hakux.texhoist", v);
+    if (!strcmp(v, "0") != g_tex_hoist_off) {
+        g_tex_hoist_off = !g_tex_hoist_off;
+        hle_log("hakuX-hle-back", "uploads into new images: %s", g_tex_hoist_off ?
+                "after the open pass" : "hoisted in front of the frame's commands");
+    }
+    v[0] = 0;
+    hle_prop_get("debug.hakux.prepearly", v);
+    if (!strcmp(v, "0") != g_prep_early_off) {
+        g_prep_early_off = !g_prep_early_off;
+        hle_log("hakuX-hle-back", "sampled targets turn into textures %s",
+                g_prep_early_off ? "when sampled" : "when left");
+    }
+    v[0] = 0;
     hle_prop_get("debug.hakux.gpucut", v);
     int cut = !strcmp(v, "frag") ? 1 : !strcmp(v, "draw") ? 2 : !strcmp(v, "pass") ? 3 :
               !strcmp(v, "tri") ? 4 : 0;
@@ -2484,8 +2603,7 @@ static void dispatch(const HleCmdHdr *h)
         break;
     case HLE_OP_VIS_END:  cmd_vis_end(p); break;
     case HLE_OP_TEX:
-        close_pass_why(PE_TEX);                 /* uploads never split a pass (P3 Task 9 hoists) */
-        hle_draw_cmd_tex(p, cb_get());
+        hle_draw_cmd_tex(p, tex_cb);            /* into a new image: hoisted, the pass goes on */
         break;
     case HLE_OP_DRAW: {
         /* a draw reading the target it renders: the pass renders in
@@ -2699,6 +2817,7 @@ int hle_back_start(void)
             .commandPool = g_back.fr[i].pool,
             .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1 };
         T.vkAllocateCommandBuffers(g_hvk.dev, &ai, &g_back.fr[i].cb);
+        T.vkAllocateCommandBuffers(g_hvk.dev, &ai, &g_back.fr[i].ucb);
     }
     hle_event_init(&g_back.kick, false);
     hle_barrier_set_waiter(hle_tl_completed, hle_tl_wait);
