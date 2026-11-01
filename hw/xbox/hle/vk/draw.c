@@ -1608,6 +1608,7 @@ static int snap_get(const HleVkSurf *rt)
 
 void hle_draw_snap(VkCommandBuffer cb, HleVkSurf *rt)
 {
+    hle_passlog_event("snapshot of", rt->id, 0);
     int i = snap_get(rt);
     g_snap_cur = i;
     g_snap_rt = rt->id;
@@ -2500,11 +2501,13 @@ static uint32_t stage_slot(const HleCmdDraw *c, unsigned st, uint32_t rt_id, uin
     } else if (c->tex[st] == rt_id && g_snap_cur >= 0 && g_snap_rt == rt_id &&
                (rt = hle_surf_get(rt_id)) != NULL) {
         slot = g_snap[g_snap_cur].slot;  /* the target, copied before the draw */
+        hle_passlog_sampled(rt_id);
         *flags |= (c->tex_lin >> st & 1) ? (1u << st) | (256u << st) : 0;
         *scl |= sscl_code(rt->scale, st);
         return slot;
     } else if (ts && (ts->general || ts->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)) {
         slot = surf_slot(ts, c->tex_ord >> 2 * st & 3);  /* RT as texture (identity) */
+        hle_passlog_sampled(ts->id);
         /* linear format: texel coords, of the surface's own scale */
         *flags |= (c->tex_lin >> st & 1) ? (1u << st) | (256u << st) : 0;
         *scl |= sscl_code(ts->scale, st);

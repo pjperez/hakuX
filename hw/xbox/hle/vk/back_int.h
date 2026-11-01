@@ -198,6 +198,10 @@ extern unsigned g_hle_zeq;
 void hle_draw_fb_bind(VkCommandBuffer cb, HleVkSurf *rt, HleVkSurf *ds, VkImageView zv,
                       bool zbar);
 extern bool g_hle_fbbar_off;            /* debug (debug.hakux.fbbar=0): no barrier */
+/* debug.hakux.passlog (back.c): a render target sampled by the pass logged now, and
+ * other work between passes */
+void hle_passlog_sampled(uint32_t surf);
+void hle_passlog_event(const char *what, uint32_t a, uint32_t b);
 extern bool g_hle_texnew;               /* debug (debug.hakux.texnew=0: off): redefined textures
                                            get new images (hle_draw_cmd_tex) */
 /* debug (debug.hakux.gpucut): 1 (frag) draws scissored to one pixel, 2 (draw)

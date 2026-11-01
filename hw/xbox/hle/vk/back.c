@@ -326,6 +326,57 @@ static const char *const k_pe_names[PE_N] = { "other", "submit", "target", "uplo
                                               "sampled target", "local read", "swap", "copy" };
 static uint64_t g_pe[PE_N];
 
+/* debug.hakux.passlog (a new value): the next frame's passes, logged in
+ * order with what each one renders to, clears, draws and samples, and the
+ * other GPU work between them: the dependencies a pass reordering has to
+ * keep. From the swap after the value is set to the next one. */
+static struct {
+    bool arm, on, in_draw;            /* in_draw: a draw is opening the pass */
+    unsigned n, draws;
+    uint32_t rt, ds, pf;
+    uint32_t sampled[16];
+    unsigned nsampled;
+} g_pl;
+
+void hle_passlog_sampled(uint32_t surf)
+{
+    if (!g_pl.on) {
+        return;
+    }
+    for (unsigned i = 0; i < g_pl.nsampled; i++) {
+        if (g_pl.sampled[i] == surf) {
+            return;
+        }
+    }
+    if (g_pl.nsampled < 16) {
+        g_pl.sampled[g_pl.nsampled++] = surf;
+    }
+}
+
+void hle_passlog_event(const char *what, uint32_t a, uint32_t b)
+{
+    if (g_pl.on) {
+        hle_log("hakuX-hle-passlog", "  %s %u %u", what, a, b);
+    }
+}
+
+static void pl_pass_end(unsigned why)
+{
+    if (!g_pl.on) {
+        return;
+    }
+    char s[160] = "";
+    int n = 0;
+    for (unsigned i = 0; i < g_pl.nsampled && n < (int)sizeof(s) - 12; i++) {
+        n += snprintf(s + n, sizeof(s) - (size_t)n, " %u", g_pl.sampled[i]);
+    }
+    HleVkSurf *r = hle_surf_get(g_pl.rt);
+    hle_log("hakuX-hle-passlog", "pass %u: rt %u (%ux%u) ds %u%s%s draws %u samples [%s ] ended: %s",
+            g_pl.n++, g_pl.rt, r ? r->d.w : 0, r ? r->d.h : 0, g_pl.ds,
+            (g_pl.pf & HLE_CLEAR_TARGET) ? " clear-colour" : "",
+            (g_pl.pf & ~HLE_CLEAR_TARGET) ? " clear-zs" : "", g_pl.draws, s, k_pe_names[why]);
+}
+
 /* GPU time per render pass while the profile is on (debug): bottom-of-pipe
  * timestamps before and after each pass (the earlier work done, then this
  * pass), read when the slot comes round, summed by the pass's place in its
@@ -675,6 +726,13 @@ static bool open_pass(bool lrz_off)
         VkClearRect zr = { .rect = ri.renderArea, .baseArrayLayer = 0, .layerCount = 1 };
         T.vkCmdClearAttachments(cb, 1, &za, 1, &zr);
     }
+    if (g_pl.on) {
+        g_pl.rt = g_back.rt;
+        g_pl.ds = g_back.ds;
+        g_pl.pf = pf;
+        g_pl.draws = g_pl.in_draw;      /* the draw that opens it, counted before */
+        g_pl.nsampled = 0;
+    }
     g_back.pass_open = true;
     g_back.zeq_wgen = 0;
     g_back.pend_clear = false;
@@ -718,6 +776,7 @@ static void close_pass_why(unsigned why)
         pt_pass_end(g_back.fr[g_back.cur].cb);
         g_back.pass_open = false;
         g_back.st.passes++;
+        pl_pass_end(why);
         g_pe[why]++;
     }
 }
@@ -748,6 +807,18 @@ static struct {
  * waiter hurries them: fewer submits, each of which ends the open pass) */
 static int64_t g_pend_ns = HLE_PEND_NS;
 static bool g_dry_hold;
+/* While a pass is open, a boundary no one waits for may wait this long
+ * (debug.hakux.pendopenus, live; 0: as without a pass): it goes out when
+ * the pass ends for another reason (cmd_set_rt) instead of splitting it.
+ * Sega GT 2002's 640x720 scene was split twice a frame by them, each a
+ * reload and a store of its colour and depth on the Mali-G52. */
+#define HLE_PEND_OPEN_NS 4000000
+static int64_t g_pend_open_ns = HLE_PEND_OPEN_NS;
+
+static inline int64_t pend_limit(void)
+{
+    return g_back.pass_open && g_pend_open_ns > g_pend_ns ? g_pend_open_ns : g_pend_ns;
+}
 
 static void submit(uint64_t value);
 
@@ -768,7 +839,7 @@ static void pend_boundary(uint64_t value)
         g_pend.since = now;
     }
     g_pend.value = value;
-    if (++g_pend.n >= 16 || now - g_pend.since >= g_pend_ns ||
+    if (++g_pend.n >= 16 || now - g_pend.since >= pend_limit() ||
         hle_atomic_read(&g_pend.urgent)) {
         pend_flush();
     }
@@ -778,7 +849,7 @@ static void pend_boundary(uint64_t value)
  * progress waiter hurries (or made urgent), is submitted */
 static inline void pend_age_check(void)
 {
-    if (unlikely(g_pend.n) && (hle_now_ns() - g_pend.since >= g_pend_ns ||
+    if (unlikely(g_pend.n) && (hle_now_ns() - g_pend.since >= pend_limit() ||
                                hle_atomic_read(&g_pend.urgent))) {
         pend_flush();
     }
@@ -836,6 +907,7 @@ static uint32_t frame_cbs(HleFrame *f, VkCommandBufferSubmitInfo cbi[2])
 
 static void submit(uint64_t value)
 {
+    hle_passlog_event("submit", 0, 0);
     if (g_pend.n && value >= g_pend.value) {
         g_pend.merged += g_pend.n;      /* this submit signals past them */
         g_pend.n = 0;
@@ -1465,6 +1537,9 @@ static void cmd_set_rt(const HleCmdSetRt *c)
     rtd_note(c->rt);
     if (c->rt != g_back.rt || c->ds != g_back.ds) {
         close_pass_why(PE_SETRT);
+        if (g_pend.n) {
+            pend_flush();               /* held for this (pend_limit): the pass has ended */
+        }
         if (c->rt != g_back.rt) {
             rtd_snap(g_back.rt);
         }
@@ -1964,6 +2039,16 @@ static void cmd_swap(const HleCmdSwap *c)
     const uint64_t n = g_back.st.swaps + 1;     /* the swap that ends the frame */
     g_fh.armed = g_fh.hook.want && g_fh.hook.want(n, g_fh.hook.opaque);
     cmd_swap_present(c);
+    if (g_pl.on) {
+        g_pl.on = false;
+        hle_log("hakuX-hle-passlog", "frame end (%u passes)", g_pl.n);
+    }
+    if (g_pl.arm) {
+        g_pl.arm = false;
+        g_pl.on = true;
+        g_pl.n = 0;
+        hle_log("hakuX-hle-passlog", "frame begin (swap %llu)", (unsigned long long)n);
+    }
     if (dump) {
         rtd_write(c->value);
     }
@@ -2040,6 +2125,14 @@ static void back_props_poll(uint64_t swap)
         hle_log("hakuX-hle-back", "boundaries wait at most %lld us", (long long)(pend / 1000));
     }
     v[0] = 0;
+    hle_prop_get("debug.hakux.pendopenus", v);
+    const int64_t popen = v[0] ? atoi(v) * 1000ll : HLE_PEND_OPEN_NS;
+    if (popen != g_pend_open_ns) {
+        g_pend_open_ns = popen;
+        hle_log("hakuX-hle-back", "boundaries in an open pass wait at most %lld us",
+                (long long)(popen / 1000));
+    }
+    v[0] = 0;
     hle_prop_get("debug.hakux.visoff", v);
     if ((atoi(v) != 0) != g_vis_dbg.off) {
         g_vis_dbg.off = !g_vis_dbg.off;
@@ -2066,6 +2159,12 @@ static void back_props_poll(uint64_t swap)
                 "the same image while the size and format stay");
     }
     hle_thread_pin_poll();              /* debug.hakux.pin: which threads get the fast cores */
+    {
+        static HleProp passlog;
+        if (hle_prop_new(&passlog, "debug.hakux.passlog", v)) {
+            g_pl.arm = true;
+        }
+    }
     v[0] = 0;
     hle_prop_get("debug.hakux.texhoist", v);
     if (!strcmp(v, "0") != g_tex_hoist_off) {
@@ -2543,6 +2642,7 @@ uint64_t hle_back_submits(void)
 static void dispatch(const HleCmdHdr *h)
 {
     const void *p = hle_cmd_payload(h);
+    g_pl.in_draw = false;               /* the draw case sets it (pass log) */
     switch (h->op) {
     case HLE_OP_STATE: case HLE_OP_STATE_PART: case HLE_OP_VIEWPORT: case HLE_OP_VSH:
     case HLE_OP_OBJ_CREATE: case HLE_OP_KICK: case HLE_OP_DRAW:
@@ -2587,15 +2687,15 @@ static void dispatch(const HleCmdHdr *h)
             close_pass();       /* debug (debug.hakux.kick=3): the pass split alone */
         }
         break;
-    case HLE_OP_READBACK: cmd_readback(p); break;
-    case HLE_OP_UPLOAD:   cmd_upload(p); break;
+    case HLE_OP_READBACK: hle_passlog_event("readback", 0, 0); cmd_readback(p); break;
+    case HLE_OP_UPLOAD:   hle_passlog_event("upload", 0, 0); cmd_upload(p); break;
     case HLE_OP_STATE:    hle_draw_cmd_state(p); break;
     case HLE_OP_STATE_PART: hle_draw_cmd_state_part(p); break;
     case HLE_OP_GAMMA:    cmd_gamma(p); break;
     case HLE_OP_OVERLAY:  cmd_overlay(p); break;
-    case HLE_OP_COPY:     cmd_copy(p); break;
-    case HLE_OP_ZREAD:    cmd_zread(p); break;
-    case HLE_OP_ZWRITE:   cmd_zwrite(p); break;
+    case HLE_OP_COPY:     hle_passlog_event("copy", 0, 0); cmd_copy(p); break;
+    case HLE_OP_ZREAD:    hle_passlog_event("zread", 0, 0); cmd_zread(p); break;
+    case HLE_OP_ZWRITE:   hle_passlog_event("zwrite", 0, 0); cmd_zwrite(p); break;
     case HLE_OP_VSH:      hle_draw_cmd_vsh(p); break;
     case HLE_OP_VIS_BEGIN:
         g_vis.active = true;
@@ -2604,9 +2704,12 @@ static void dispatch(const HleCmdHdr *h)
         break;
     case HLE_OP_VIS_END:  cmd_vis_end(p); break;
     case HLE_OP_TEX:
+        hle_passlog_event("texture", ((const HleCmdTex *)p)->id, g_back.pass_open);
         hle_draw_cmd_tex(p, tex_cb);            /* into a new image: hoisted, the pass goes on */
         break;
     case HLE_OP_DRAW: {
+        g_pl.draws += g_pl.on;
+        g_pl.in_draw = g_pl.on;
         /* a draw reading the target it renders: the pass renders in
          * RENDERING_LOCAL_READ (reopened once when it was not) */
         unsigned fb = hle_draw_fb_stages(p, g_back.rt);
