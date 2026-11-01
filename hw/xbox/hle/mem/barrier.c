@@ -628,12 +628,15 @@ void hle_barrier_guard_stats(uint64_t *neighbours, uint64_t *hot)
  * 60; ~0.7 s a second waited). */
 #define RPT_PAGES   8
 #define RPT_PENDING 256
-/* How long a read waits for its reports: then they are settled with each
- * test's last result (rpt_settle). It was 30 ms, never settled: in Sega GT
- * 2002's races ~1 read in 12 waited it out (a dropped frame each) and 9 in
- * 10 found the decoder held short of them; ~8% of the guest's thread
- * waited, for reads that got no result, and a report left pending kept the
- * title polling it. debug.hakux.rptwait=<ms>: live. */
+/* How long a read waits for reports none of whose tests has a result yet:
+ * then they are given up. Reports whose tests all have one are settled with
+ * it at once (rpt_settle), as Dolphin and PCSX2 serve late occlusion
+ * results. The gate waited 30 ms for every read and settled nothing: in
+ * Sega GT 2002's races ~1 read in 12 waited it out (a dropped frame each)
+ * and 9 in 10 found the decoder held short of them; ~8% of the guest's
+ * thread waited, for reads that got no result. Waiting up to 6 ms and then
+ * settling, ~13% waited (the title read 2.5x as often); settled at once,
+ * ~0%. debug.hakux.rptwait=<ms>: live, the wait for the rest. */
 #define RPT_WAIT_MS 6
 #define RPT_LAST    64
 static struct {
@@ -834,6 +837,20 @@ static int64_t rpt_wait_ns(void)
     return ns;
 }
 
+/* Whether every report of page pg from frames before `frame` (rpt_lock
+ * held) has its test's last result to be settled with. */
+static bool rpt_settleable(unsigned pg, uint32_t frame)
+{
+    for (unsigned k = 0; k < RPT_PENDING; k++) {
+        if (g_rpt.e[k].seq && g_rpt.e[k].pa >> 12 == g_rpt.page[pg] &&
+            (int32_t)(g_rpt.e[k].frame - frame) < 0 &&
+            g_rpt.last[rpt_last_slot(g_rpt.e[k].pa)].pa != g_rpt.e[k].pa) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* The guest's access to a report page (its thread): true if it was one. */
 static bool rpt_access(uint32_t pa)
 {
@@ -871,12 +888,15 @@ static bool rpt_access(uint32_t pa)
             late = rpt_late((unsigned)pg, frame, &ahead);
             /* the decoder short of a report and waiting on this thread */
             const bool stuck = late && ahead && held && held();
-            if (late && (stuck || hle_now_ns() - t0 > wait_ns)) {
+            const bool now = late && rpt_settleable((unsigned)pg, frame);
+            if (late && (stuck || now || hle_now_ns() - t0 > wait_ns)) {
                 /* the back end won't write them now (stuck), in time, or at
                  * all (a test the decoder dropped): settled */
                 rpt_settle((unsigned)pg, frame);
                 if (stuck) {
                     g_rpt.held++;
+                } else if (now) {
+                    /* settled: not a wait given up */
                 } else if (g_rpt.timeouts++ < 8) {
                     hle_log("hakuX-hle-pb", "report gate: page %08x's reports not written in %lld ms",
                             g_rpt.page[pg] << 12, (long long)(wait_ns / 1000000));
