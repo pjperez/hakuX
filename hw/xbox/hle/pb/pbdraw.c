@@ -649,26 +649,97 @@ static void restored_pixels(PbObj *o)
     }
 }
 
+/* An object still in use: the bound targets, the one shown, a z-read's
+ * source, the one just made (a bind makes its colour target, then its depth
+ * one) */
+static bool obj_busy(const PbObj *o)
+{
+    bool busy = o->id == g_pd.rt || o->id == g_pd.ds || o->id == g_pd.shown_id ||
+                o->id == g_pd.made;
+    for (unsigned j = 0; j < g_pd.nzr && !busy; j++) {
+        busy = g_pd.zr[j].src == o->id;
+    }
+    return busy;
+}
+
 /* The slot a new object takes once all are used: the one bound longest ago
- * (never bound first), and never one still in use: the bound targets, the
- * one shown, a cube or its faces (views into it), a z-read's source, the
- * one just made (a bind makes its colour target, then its depth one).
- * NULL if every one is. */
+ * (never bound first), and never one still in use (obj_busy), nor a cube or
+ * its faces (views into it: they go together, drop_cube). NULL if every one
+ * is. */
 static PbObj *evict_slot(void)
 {
     PbObj *best = NULL;
     for (unsigned i = 0; i < g_pd.nobjs; i++) {
         PbObj *o = &g_pd.objs[i];
-        bool busy = o->id == g_pd.rt || o->id == g_pd.ds || o->id == g_pd.shown_id ||
-                    o->id == g_pd.made || o->cube || o->d.parent;
-        for (unsigned j = 0; j < g_pd.nzr && !busy; j++) {
-            busy = g_pd.zr[j].src == o->id;
-        }
-        if (!busy && (!best || o->bound < best->bound)) {
+        if (!o->cube && !o->d.parent && !obj_busy(o) && (!best || o->bound < best->bound)) {
             best = o;
         }
     }
     return best;
+}
+
+/* The cube used longest ago, if before `before`, and none of its faces in
+ * use: its image and its faces' targets (views into it) go, their slots
+ * freed. A cube is used when its faces are bound and when a stage samples it
+ * (cube_of_targets). Kept for good, every scene's cubes filled the table:
+ * Sega GT 2002 makes two 64 x 64 sun cubes per race and demo, 13 objects
+ * each; within the hour its next one could not be made, its faces' targets
+ * neither, and the cars came out white. */
+static PbObj *obj_of(uint32_t id);
+
+static bool drop_cube(uint64_t before)
+{
+    const PbObj *best = NULL;
+    uint64_t best_age = 0;
+    for (unsigned i = 0; i < g_pd.nobjs; i++) {
+        const PbObj *c = &g_pd.objs[i];
+        if (!c->cube) {
+            continue;
+        }
+        uint64_t age = c->bound;
+        bool busy = false;
+        for (unsigned j = 0; j < g_pd.nobjs && !busy; j++) {
+            const PbObj *v = &g_pd.objs[j];
+            if (v->d.parent == c->id) {
+                age = MAX(age, v->bound);
+                busy = obj_busy(v);
+            }
+        }
+        if (!busy && age < before && (!best || age < best_age)) {
+            best = c;
+            best_age = age;
+        }
+    }
+    if (!best) {
+        return false;
+    }
+    const uint32_t cube = best->id;
+    uint32_t gone[MAX_OBJS];
+    unsigned n = 0, ngone = 0;
+    for (unsigned i = 0; i < g_pd.nobjs; i++) {
+        const PbObj *o = &g_pd.objs[i];
+        if (o->d.parent == cube) {
+            gone[ngone++] = o->id;          /* the views before the cube */
+        } else if (o->id != cube) {
+            g_pd.objs[n++] = *o;
+        }
+    }
+    gone[ngone++] = cube;
+    g_pd.nobjs = n;
+    g_pd.rt_obj = obj_of(g_pd.rt);      /* the slots moved */
+    g_pd.ds_obj = obj_of(g_pd.ds);
+    for (unsigned i = 0; i < ngone; i++) {
+        HleCmdObjDestroy *x = begin(HLE_OP_OBJ_DESTROY, sizeof(*x));
+        x->after = 0;
+        x->id = gone[i];
+        hle_fe_commit();
+    }
+    static unsigned s_logged;
+    if (s_logged++ < 16) {
+        hle_log("hakuX-hle-pb", "cube %u: unused longest, it and its %u faces' targets dropped", cube,
+                ngone - 1);
+    }
+    return true;
 }
 
 /* The object for a surface (memory, format, pitch, size), made the first
@@ -703,6 +774,10 @@ static uint32_t object(uint32_t pa, uint32_t xfmt, uint32_t pitch, uint32_t w, u
         return best;
     }
     PbObj *o;
+    if (g_pd.nobjs == MAX_OBJS) {
+        const PbObj *e = evict_slot();
+        drop_cube(e ? e->bound : UINT64_MAX);   /* a cube unused longer: its slots */
+    }
     if (g_pd.nobjs < MAX_OBJS) {
         o = &g_pd.objs[g_pd.nobjs++];
     } else {
@@ -2155,6 +2230,7 @@ static uint32_t cube_of_targets(uint32_t pa, uint32_t code, uint32_t w, uint32_t
 {
     for (unsigned i = 0; i < g_pd.nobjs; i++) {
         if (g_pd.objs[i].cube && g_pd.objs[i].d.pa == pa && g_pd.objs[i].d.w == w) {
+            g_pd.objs[i].bound = g_pd.binds;    /* sampled: in use (drop_cube) */
             return g_pd.objs[i].id;
         }
     }
@@ -2169,14 +2245,19 @@ static uint32_t cube_of_targets(uint32_t pa, uint32_t code, uint32_t w, uint32_t
                 xfmt = g_pd.objs[i].d.xfmt;
             }
         }
-        if (!found || g_pd.nobjs >= MAX_OBJS) {
+        if (!found) {
             return 0;
         }
+    }
+    /* none used since the last bind goes: the draw being built may sample it */
+    if (g_pd.nobjs >= MAX_OBJS && !drop_cube(g_pd.binds)) {
+        return 0;
     }
     PbObj *c = &g_pd.objs[g_pd.nobjs++];
     memset(c, 0, sizeof(*c));
     c->id = g_pd.next_id++;
     c->cube = true;
+    c->bound = g_pd.binds;
     c->d = (HleSurfDesc){ .id = c->id, .xfmt = xfmt, .w = w, .h = w, .pa = pa, .levels = 1, .faces = 6 };
     HleCmdObj *oc = begin(HLE_OP_OBJ_CREATE, sizeof(*oc));
     oc->s = c->d;
@@ -2635,8 +2716,10 @@ static uint32_t target_part(uint32_t pa, uint32_t code, const HleFmtInfo *fi, ui
         return dst ? dst->id : 0;           /* the image there is the newer */
     }
     if (!dst) {
+        const uint32_t sid = src->id;
         dst = obj_of(object(pa, code, pitch, w, h));
-        if (!dst || dst == src) {
+        src = obj_of(sid);                  /* (its slot may have moved: drop_cube) */
+        if (!dst || !src || dst == src) {
             return 0;
         }
     }
