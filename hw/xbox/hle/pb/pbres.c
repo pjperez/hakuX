@@ -519,6 +519,29 @@ void hle_draw_prim_indices(uint32_t pt, const uint16_t *in, uint32_t n, uint32_t
 
 /* ---- render targets ---------------------------------------------------------------- */
 
+/* With zero-copy RAM too, a target's rows go through the arena: read in
+ * place, the GPU saw lines the CPU still held when page tracking missed a
+ * write (Sega GT 2002's car-select reflection cubes, written by the CPU when
+ * the screen opens, came out white). A few uploads a screen. Debug:
+ * debug.hakux.updirect=1 (live) reads them in place again. */
+static bool upload_direct(void)
+{
+#ifdef __ANDROID__
+    static int64_t polled;
+    static bool direct;
+    const int64_t now = hle_now_ns();
+    if (now - polled > 1000000000) {
+        polled = now;
+        char v[PROP_VALUE_MAX] = "";
+        hle_prop_get("debug.hakux.updirect", v);
+        direct = atoi(v) != 0;
+    }
+    return direct;
+#else
+    return false;
+#endif
+}
+
 void hle_res_upload(uint32_t id, uint32_t pa, uint32_t pitch, uint32_t n,
                     const HleRect *rects, const int32_t (*pts)[2])
 {
@@ -537,7 +560,8 @@ void hle_res_upload(uint32_t id, uint32_t pa, uint32_t pitch, uint32_t n,
          * rows, as they are now, through the arena (allocated before the
          * command: a full arena kicks one) */
         uint32_t arena = 0;
-        if ((!g_hram.zero_copy || hle_barrier_contended(clo, chi - clo)) && chi > clo) {
+        if ((!g_hram.zero_copy || !upload_direct() || hle_barrier_contended(clo, chi - clo)) &&
+            chi > clo) {
             uint8_t *dst;
             const uint8_t *src = hle_pa_ptr(clo, chi - clo);
             uint32_t off = src ? hle_draw_arena_alloc(chi - clo, &dst) : HLE_ARENA_FULL;
