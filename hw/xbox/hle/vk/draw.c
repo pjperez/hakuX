@@ -123,8 +123,9 @@ typedef struct HlePipe {
 
 /* The state commands a draw may record, counted for the per-second log: what
  * the GPU does between draws. */
-enum { EM_PIPE, EM_SET1, EM_PC, EM_VI, EM_VB, EM_VP, EM_SC, EM_DYN, EM_FB, EM_N };
-static const char *const k_em_names[EM_N] = { "pipe", "set1", "pc", "vi", "vb", "vp", "sc", "dyn", "fb" };
+enum { EM_PIPE, EM_SET1, EM_PC, EM_VI, EM_VB, EM_VP, EM_SC, EM_DYN, EM_FB, EM_SET0, EM_N };
+static const char *const k_em_names[EM_N] = { "pipe", "set1", "pc", "vi", "vb", "vp", "sc", "dyn", "fb",
+                                              "set0" };
 
 /* Without descriptor indexing (caps.bindless off): a slot as the bindless set
  * would hold it (write_slot_layout3): its 2D, cube and 3D views (the white
@@ -201,6 +202,10 @@ static struct {
     uint64_t idx_same, idx_contig;      /* indexed merge potential (hle_draw_ff_diag) */
     uint64_t emits[EM_N];               /* state commands recorded, by EM_* kind */
     uint64_t mergeable;                 /* draws that could have joined the previous one */
+    /* batching potential (counted, not done): a draw whose only change from
+     * the previous one (same pass, topology and indexing) is its vertex
+     * constants (set 1) and/or vertex buffer offsets */
+    uint64_t batchable, batch_consts, batch_vb;
     uint64_t nomerge[5];                /* why not: strip/fan, indexed, state, other work, vertex gap */
     uint64_t drops[6];                  /* draws dropped, by DROP_* reason */
     /* asynchronous builds (pipeasync.h): queued to the workers, built by them,
@@ -3334,6 +3339,7 @@ static void fixed_bind(VkCommandBuffer cb, HleFfPush *pc)
         g_rec.set0 = set;
         T.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_dr.layout, 0, 1, &set,
                                   0, NULL);
+        g_dr.emits[EM_SET0]++;
     }
 }
 
@@ -4303,6 +4309,28 @@ void hle_draw_cmd_draw(const HleCmdDraw *c, VkCommandBuffer cb, uint32_t rt_id, 
         } else {
             g_dr.mergeable++;
         }
+        {
+            static uint64_t pe[EM_N], pbreaks;
+            static uint32_t pprim;
+            static bool pvalid, pidx;
+            uint64_t other = 0;
+            for (unsigned i = 0; i < EM_N; i++) {
+                if (i != EM_SET1 && i != EM_VB) {
+                    other += g_dr.emits[i] - pe[i];
+                }
+            }
+            const bool idx = c->ib_off != UINT32_MAX;
+            if (pvalid && !other && hle_back_breaks == pbreaks && pprim == c->prim && pidx == idx) {
+                g_dr.batchable++;
+                g_dr.batch_consts += g_dr.emits[EM_SET1] != pe[EM_SET1];
+                g_dr.batch_vb += g_dr.emits[EM_VB] != pe[EM_VB];
+            }
+            memcpy(pe, g_dr.emits, sizeof(pe));
+            pbreaks = hle_back_breaks;
+            pprim = c->prim;
+            pidx = idx;
+            pvalid = true;
+        }
         /* indexed: no state since the previous indexed draw (same topology),
          * and of those, the ones whose indices also follow its own at the
          * same vertex base (one draw as they are) */
@@ -4438,6 +4466,14 @@ void hle_draw_ff_diag(void)
                   (unsigned long long)(g_dr.idx_contig - prev_icontig));
     prev_isame = g_dr.idx_same;
     prev_icontig = g_dr.idx_contig;
+    static uint64_t prev_bt, prev_btc, prev_btv;
+    n += snprintf(line + n, sizeof(line) - (size_t)n, " batchable=%llu (consts %llu vb %llu)",
+                  (unsigned long long)(g_dr.batchable - prev_bt),
+                  (unsigned long long)(g_dr.batch_consts - prev_btc),
+                  (unsigned long long)(g_dr.batch_vb - prev_btv));
+    prev_bt = g_dr.batchable;
+    prev_btc = g_dr.batch_consts;
+    prev_btv = g_dr.batch_vb;
     for (unsigned i = 0; i < EM_N && n > 0 && (size_t)n < sizeof(line); i++) {
         n += snprintf(line + n, sizeof(line) - (size_t)n, " %s=%llu", k_em_names[i],
                       (unsigned long long)(g_dr.emits[i] - prev[i]));
